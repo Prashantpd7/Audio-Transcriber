@@ -12,6 +12,7 @@ import sys
 import threading
 from pathlib import Path
 import time
+import traceback as _traceback
 
 # ---------------------------------------------------------------------------
 #  Startup log — always write to ~/Library/Logs/AudioTranscriber.log
@@ -78,6 +79,70 @@ except ImportError:
     WhisperModel = None
 
 # ---------------------------------------------------------------------------
+#  Diagnostics: log model / cache paths at import time
+# ---------------------------------------------------------------------------
+_cache_home = os.path.expanduser("~/.cache/huggingface")
+_hub_dir = os.path.join(_cache_home, "hub")
+_model_id = "models--Systran--faster-whisper-large-v3"
+_model_cache_dir = os.path.join(_hub_dir, _model_id)
+
+def _log_model_diagnostics():
+    """Log details about the Whisper model cache so we can diagnose load failures."""
+    _log(f"cache home: {_cache_home}")
+    _log(f"cache exists: {os.path.isdir(_cache_home)}")
+    _log(f"cache size: {_dir_size(_cache_home)}")
+    if os.path.isdir(_model_cache_dir):
+        snap_dir = os.path.join(_model_cache_dir, "snapshots")
+        if os.path.isdir(snap_dir):
+            snaps = os.listdir(snap_dir)
+            _log(f"model snapshots: {snaps}")
+            if snaps:
+                snap_path = os.path.join(snap_dir, snaps[0])
+                for fn in ("model.bin", "tokenizer.json", "config.json", "vocabulary.json", "preprocessor_config.json"):
+                    fp = os.path.join(snap_path, fn)
+                    sz = _file_size(fp)
+                    _log(f"  {fn}: {sz}")
+    # Log faster-whisper package assets (silero_vad_v6.onnx etc.)
+    try:
+        import faster_whisper
+        fw_dir = os.path.dirname(faster_whisper.__file__)
+        assets_dir = os.path.join(fw_dir, "assets")
+        if os.path.isdir(assets_dir):
+            for afn in os.listdir(assets_dir):
+                afp = os.path.join(assets_dir, afn)
+                if os.path.isfile(afp):
+                    _log(f"fw asset: {afn} ({os.path.getsize(afp)} bytes)")
+    except Exception:
+        pass
+
+def _file_size(path: str) -> str:
+    try:
+        sz = os.path.getsize(path)
+        if sz > 1_000_000_000:
+            return f"{sz / 1_000_000_000:.2f} GB"
+        if sz > 1_000_000:
+            return f"{sz / 1_000_000:.1f} MB"
+        return f"{sz:,} bytes"
+    except Exception:
+        return "NOT FOUND"
+
+def _dir_size(path: str) -> str:
+    try:
+        total = 0
+        for dirpath, _, filenames in os.walk(path):
+            for fn in filenames:
+                fp = os.path.join(dirpath, fn)
+                try:
+                    total += os.path.getsize(fp)
+                except Exception:
+                    pass
+        if total > 1_000_000_000:
+            return f"{total / 1_000_000_000:.2f} GB"
+        return f"{total:,} bytes"
+    except Exception:
+        return "?"
+
+# ---------------------------------------------------------------------------
 #  Constants
 # ---------------------------------------------------------------------------
 APP_TITLE = "Audio Transcriber"
@@ -115,13 +180,21 @@ def _load_model(status_callback=None):
 
     with _model_lock:
         if _model is None:
-            _model = WhisperModel(
-                MODEL_SIZE,
-                device="cpu",
-                compute_type="int8",   # best speed/accuracy on Apple Silicon CPU
-                cpu_threads=4,
-                num_workers=2,
-            )
+            _log("WhisperModel constructor called…")
+            _log_model_diagnostics()
+            try:
+                _model = WhisperModel(
+                    MODEL_SIZE,
+                    device="cpu",
+                    compute_type="int8",   # best speed/accuracy on Apple Silicon CPU
+                    cpu_threads=4,
+                    num_workers=2,
+                )
+                _log("WhisperModel constructor OK")
+            except Exception as _me:
+                _log(f"WhisperModel constructor FAILED: {_me}")
+                _log(f"Full traceback:\n{_traceback.format_exc()}")
+                raise
     if status_callback:
         status_callback("Model loaded.")
 
@@ -148,22 +221,29 @@ def transcribe_audio(
         status_callback("Transcribing…")
 
     with _model_lock:
-        segments, info = _model.transcribe(
-            file_path,
-            beam_size=5,
-            best_of=5,
-            temperature=0.0,          # deterministic, highest accuracy
-            word_timestamps=False,    # we don't need per-word data
-            vad_filter=True,          # skip silence
-            vad_parameters=dict(
-                min_silence_duration_ms=500,
-                threshold=0.5,
-            ),
-            condition_on_previous_text=True,
-            no_speech_threshold=0.6,
-            compression_ratio_threshold=2.4,
-            log_prob_threshold=-1.0,
-        )
+        _log("model.transcribe() called…")
+        try:
+            segments, info = _model.transcribe(
+                file_path,
+                beam_size=5,
+                best_of=5,
+                temperature=0.0,          # deterministic, highest accuracy
+                word_timestamps=False,    # we don't need per-word data
+                vad_filter=True,          # skip silence
+                vad_parameters=dict(
+                    min_silence_duration_ms=500,
+                    threshold=0.5,
+                ),
+                condition_on_previous_text=True,
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.4,
+                log_prob_threshold=-1.0,
+            )
+            _log("model.transcribe() returned OK")
+        except Exception as _te:
+            _log(f"model.transcribe() FAILED: {_te}")
+            _log(f"Full traceback:\n{_traceback.format_exc()}")
+            raise
 
     # Collect results
     collected_segments = []
@@ -585,8 +665,7 @@ class TranscriberApp:
         self.root.destroy()
 
 
-# ---------------------------------------------------------------------------
-#  Startup log: write right after tkinter import so we know it worked
+# ---------------------------------------------------------------------------    # Startup log: write right after tkinter import so we know it worked
 # ---------------------------------------------------------------------------
 _log(f"tkinter imported OK: {tk.Tcl().eval('info patchlevel')}")
 
@@ -594,13 +673,18 @@ _log(f"tkinter imported OK: {tk.Tcl().eval('info patchlevel')}")
 #  Entry point
 # ---------------------------------------------------------------------------
 def main():
-    _log("main() called")
+    import multiprocessing as _mp
+    _mp.freeze_support()
+    _log("main() called, freeze_support() done")
 
     if WhisperModel is None:
         msg = "faster-whisper is not installed. Run: pip install faster-whisper"
         _log(f"FATAL: {msg}")
         print(f"ERROR: {msg}", file=sys.stderr)
         sys.exit(1)
+
+    # Log diagnostics before creating the UI
+    _log_model_diagnostics()
 
     try:
         _log("Creating Tk root window…")

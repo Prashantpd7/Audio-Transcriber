@@ -58,6 +58,13 @@ if _tcl_lib.exists():
 if _tk_lib.exists():
     extra_binaries.append((str(_tk_lib), "."))
 
+# ---------- data files (needed at runtime, NOT collected automatically) ----------
+extra_datas = []
+# faster-whisper VAD model  (silero_vad_v6.onnx) — required for vad_filter=True
+_vad_asset = SITE_PACKAGES / "faster_whisper" / "assets" / "silero_vad_v6.onnx"
+if _vad_asset.exists():
+    extra_datas.append((str(_vad_asset), "faster_whisper/assets"))
+
 # ---------------------------------------------------------------------------
 # Hidden imports
 # ---------------------------------------------------------------------------
@@ -148,7 +155,7 @@ a = Analysis(
     ["transcriber.py"],
     pathex=[],
     binaries=extra_binaries,
-    datas=[],
+    datas=extra_datas,
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},
@@ -156,14 +163,17 @@ a = Analysis(
     excludes=excluded_imports,
     noarchive=False,
     module_collection_mode={
-        "faster_whisper": "pyz+py",
-        "ctranslate2": "pyz+py",
-        "onnxruntime": "pyz+py",
-        "av": "pyz+py",
-        "huggingface_hub": "pyz+py",
-        "tokenizers": "pyz+py",
-        "numpy": "pyz+py",
-        "tkinter": "pyz+py",
+        # 'py' = store as files only (bypass PYZ compression)
+        # This prevents zlib 'Error -5 while decompressing data' errors
+        # that occur when large model packages are compressed into the PYZ.
+        "faster_whisper": "py",
+        "ctranslate2": "py",
+        "onnxruntime": "py",
+        "av": "py",
+        "huggingface_hub": "py",
+        "tokenizers": "py",
+        "numpy": "py",
+        "tkinter": "py",
     },
 )
 

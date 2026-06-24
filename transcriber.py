@@ -292,12 +292,16 @@ def transcribe_audio(
     file_path: str,
     progress_callback=None,
     status_callback=None,
+    cancel_check=None,
 ) -> dict:
     """
     Run transcription on *file_path* inside a worker thread.
 
     Uses PyAV to decode audio (supports MP3, MP4, WAV, M4A, AAC, FLAC,
     OGG, WEBM — and any format PyAV can handle).
+
+    *cancel_check* is an optional callable that returns True if
+    cancellation has been requested.
 
     Returns a dict with keys:
         text          – formatted transcription
@@ -323,11 +327,21 @@ def transcribe_audio(
         _log(f"Full traceback:\n{_traceback.format_exc()}")
         raise
 
+    # Check for cancellation after loading
+    if cancel_check and cancel_check():
+        _log("Transcription cancelled after audio loading")
+        raise RuntimeError("Cancelled")
+
     # --- Step 2: Ensure model is loaded ---
     _load_model(status_callback)
 
     if status_callback:
         status_callback("Transcribing…")
+
+    # Check for cancellation before transcribe
+    if cancel_check and cancel_check():
+        _log("Transcription cancelled before model.transcribe()")
+        raise RuntimeError("Cancelled")
 
     # --- Step 3: Transcribe ---
     with _model_lock:
@@ -359,6 +373,11 @@ def transcribe_audio(
     collected_segments = []
 
     for seg in segments:
+        # Check for cancellation between segments
+        if cancel_check and cancel_check():
+            _log("Transcription cancelled during segment collection")
+            raise RuntimeError("Cancelled")
+
         seg_dict = {
             "start": seg.start,
             "end": seg.end,
@@ -528,7 +547,9 @@ def _to_hinglish(text: str) -> str:
 
 # ---------------------------------------------------------------------------
 #  Live microphone transcription (chunk-based, runs in background thread)
-# ---------------------------------------------------------------------------    def _transcribe_chunk(audio_chunk: np.ndarray):
+# ---------------------------------------------------------------------------
+
+def _transcribe_chunk(audio_chunk: np.ndarray):
     """
     Transcribe a short audio chunk using the shared model.
 
@@ -584,6 +605,7 @@ class TranscriberApp:
         self.transcription_text: str = ""
         self.is_transcribing = False
         self.worker_thread: threading.Thread | None = None
+        self._cancel_requested = False
 
         # Live microphone state
         self.is_listening = False
@@ -652,15 +674,26 @@ class TranscriberApp:
             progress_frame, textvariable=self.status_var, font=("Helvetica", 9)
         ).pack(side=tk.LEFT)
 
-        self.progress = ttk.Progressbar(
-            progress_frame, mode="determinate", length=120
+        # Cancel button (hidden by default, shown during file transcription)
+        self.cancel_btn = ttk.Button(
+            progress_frame,
+            text="✕",
+            command=self._cancel_transcription,
+            width=3,
+            style="Cancel.TButton",
+            state=tk.DISABLED,
         )
-        self.progress.pack(side=tk.RIGHT, padx=(4, 0))
+        self.cancel_btn.pack(side=tk.RIGHT, padx=(4, 0))
 
         self.pct_label = ttk.Label(
-            progress_frame, text="", font=("Helvetica", 9), foreground="#2563eb", width=5
+            progress_frame, text="", font=("Helvetica", 9), foreground="#2563eb", width=4
         )
         self.pct_label.pack(side=tk.RIGHT)
+
+        self.progress = ttk.Progressbar(
+            progress_frame, mode="determinate"
+        )
+        self.progress.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(0, 4))
 
         # --- Info row: language + elapsed time ---
         info_frame = ttk.Frame(self.root, padding=(12, 0, 12, 2))
@@ -730,15 +763,15 @@ class TranscriberApp:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.text_widget.configure(yscrollcommand=scrollbar.set)
 
-        # Clear button at bottom-right — hidden until there's text
+        # Clear button at bottom-right — always visible (disabled when empty)
         self.clear_btn = ttk.Button(
             text_inner,
             text="Clear",
             command=self._clear_transcript,
             width=8,
+            state=tk.DISABLED,
         )
         self.clear_btn.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se")
-        self.clear_btn.place_forget()  # hidden initially
 
         # --- Button styles (all uniform) ---
         style.configure(
@@ -787,6 +820,17 @@ class TranscriberApp:
             "Clear.TButton",
             font=("Helvetica", 9),
         )
+        style.configure(
+            "Cancel.TButton",
+            font=("Helvetica", 10, "bold"),
+            foreground="white",
+            background="#dc2626",
+            bordercolor="#b91c1c",
+        )
+        style.map(
+            "Cancel.TButton",
+            background=[("active", "#b91c1c"), ("!active", "#dc2626")],
+        )
 
         # Keyboard shortcuts
         self.root.bind("<Command-o>", lambda _: self._select_file())
@@ -820,7 +864,7 @@ class TranscriberApp:
         self.is_listening = True
         self.live_stop.clear()
         self.record_btn.config(text="Stop", style="StopRecord.TButton")
-        self.clear_btn.place_forget()  # hide Clear during recording
+        self.clear_btn.config(state=tk.DISABLED)  # disable Clear during recording
         self.select_btn.config(state=tk.DISABLED)
         self.transcribe_btn.config(state=tk.DISABLED)
 
@@ -867,12 +911,13 @@ class TranscriberApp:
         self.save_btn.config(state=tk.DISABLED)
         self.status_var.set("Transcript cleared.")
         self.lang_var.set("")
-        self.clear_btn.place_forget()
+        self.clear_btn.config(state=tk.DISABLED)
 
     def _live_listen_worker(self):
         """
-        Background worker: capture microphone audio in 3-second chunks
-        and transcribe each chunk. Appends results to the transcript.
+        Background worker: capture microphone audio using a continuous
+        InputStream (keeps the mic open — no on/off flashing) and
+        transcribe each chunk. Appends results to the transcript.
         """
         import sounddevice as sd
 
@@ -892,50 +937,78 @@ class TranscriberApp:
             if continuous_text:
                 continuous_text += "\n\n--- New Recording ---\n\n"
 
-            while not self.live_stop.is_set():
-                # Record a chunk
-                try:
-                    recording = sd.rec(
-                        LIVE_CHUNK_SAMPLES,
-                        samplerate=LIVE_SAMPLE_RATE,
-                        channels=1,
-                        dtype="float32",
-                    )
-                    sd.wait()  # blocks for LIVE_CHUNK_SECONDS
-                except Exception as _re:
-                    _log(f"Sounddevice rec failed: {_re}")
-                    raise
+            # Buffer to accumulate raw audio between chunk transcriptions
+            audio_buffer = []
+            samples_per_chunk = LIVE_CHUNK_SAMPLES
 
-                if self.live_stop.is_set():
-                    break
+            # Callback for InputStream — called by sounddevice in a background thread
+            def _audio_callback(indata, frames, time_info, status):
+                if status:
+                    _log(f"InputStream status: {status}")
+                audio_buffer.append(indata.copy())
 
-                audio = recording.flatten()
+            # Open a continuous InputStream — mic stays ON the whole time
+            stream = sd.InputStream(
+                samplerate=LIVE_SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                callback=_audio_callback,
+            )
+            stream.start()
+            _log("InputStream started — mic is now continuously open")
 
-                # Check for silence — skip if max amplitude is below threshold
-                rms = np.sqrt(np.mean(audio ** 2))
-                peak = np.max(np.abs(audio))
-                _log(f"Chunk: RMS={rms:.6f}, peak={peak:.6f}, threshold={LIVE_SILENCE_THRESHOLD}")
-                if peak < LIVE_SILENCE_THRESHOLD:
-                    _log("  -> below threshold, skipping")
-                    continue
+            try:
+                while not self.live_stop.is_set():
+                    # Sleep a bit to let audio accumulate
+                    time.sleep(0.1)
 
-                # Show "Processing..." status while transcribing
-                self.root.after(0, lambda: self.status_var.set("Processing..."))
+                    # Calculate how many samples we have buffered
+                    total_samples = sum(len(chunk) for chunk in audio_buffer)
+                    if total_samples < samples_per_chunk:
+                        continue  # not enough audio yet
 
-                # Transcribe the chunk
-                _log(f"  -> transcribing...")
-                text, lang, lang_prob = _transcribe_chunk(audio)
-                _log(f"  -> result: text_len={len(text)}, lang={lang}")
-                if text:
-                    if continuous_text:
-                        continuous_text += " " + text
+                    # Concatenate buffered audio up to chunk size
+                    all_audio = np.concatenate(audio_buffer, axis=0).flatten()
+                    if len(all_audio) >= samples_per_chunk:
+                        chunk = all_audio[:samples_per_chunk]
+                        # Keep remainder for next chunk
+                        remaining = all_audio[samples_per_chunk:]
+                        audio_buffer.clear()
+                        if len(remaining) > 0:
+                            audio_buffer.append(remaining.reshape(-1, 1))
                     else:
-                        continuous_text = text
-                    # Update UI on main thread
-                    self.root.after(0, self._on_live_text, continuous_text, lang, lang_prob)
-                else:
-                    # No speech detected in this chunk — restore listening status
-                    self.root.after(0, lambda: self.status_var.set("Listening..."))
+                        continue  # not enough after all
+
+                    if self.live_stop.is_set():
+                        break
+
+                    # Check for silence
+                    rms = np.sqrt(np.mean(chunk ** 2))
+                    peak = np.max(np.abs(chunk))
+                    _log(f"Chunk: RMS={rms:.6f}, peak={peak:.6f}, threshold={LIVE_SILENCE_THRESHOLD}")
+                    if peak < LIVE_SILENCE_THRESHOLD:
+                        _log("  -> below threshold, skipping")
+                        continue
+
+                    # Show "Processing..." while transcribing
+                    self.root.after(0, lambda: self.status_var.set("Processing..."))
+
+                    _log(f"  -> transcribing...")
+                    text, lang, lang_prob = _transcribe_chunk(chunk)
+                    _log(f"  -> result: text_len={len(text)}, lang={lang}")
+                    if text:
+                        if continuous_text:
+                            continuous_text += " " + text
+                        else:
+                            continuous_text = text
+                        self.root.after(0, self._on_live_text, continuous_text, lang, lang_prob)
+                    else:
+                        self.root.after(0, lambda: self.status_var.set("Listening..."))
+
+            finally:
+                stream.stop()
+                stream.close()
+                _log("InputStream closed — mic turned off")
 
             _log(f"Live listen worker stopped. Final length: {len(continuous_text)} chars")
 
@@ -966,6 +1039,8 @@ class TranscriberApp:
         if lang and lang != "unknown":
             prob_pct = f"{lang_prob * 100:.0f}%" if lang_prob else "—"
             self.lang_var.set(f"Detected: {lang} ({prob_pct})")
+        # Show Clear button once we have text
+        self.clear_btn.config(state=tk.NORMAL)
         # Restore listening status after processing
         self.status_var.set("Listening..." if self.is_listening else "Ready")
 
@@ -982,9 +1057,12 @@ class TranscriberApp:
         self.record_btn.config(text="Record", style="Record.TButton")
         self.select_btn.config(state=tk.NORMAL)
         self.transcribe_btn.config(state=tk.NORMAL)
-        self.status_var.set("Stopped.")
+        if self.status_var.get().startswith("Error"):
+            pass  # keep error message visible
+        else:
+            self.status_var.set("Stopped.")
+        self.clear_btn.config(state=tk.NORMAL if self.transcription_text else tk.DISABLED)
         if self.transcription_text:
-            self.clear_btn.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se")
             self.copy_btn.config(state=tk.NORMAL)
             self.save_btn.config(state=tk.NORMAL)
 
@@ -1052,6 +1130,7 @@ class TranscriberApp:
             return
 
         self.is_transcribing = True
+        self._cancel_requested = False
         self._set_ui_busy(True)
 
         self.text_widget.config(state=tk.NORMAL)
@@ -1060,7 +1139,9 @@ class TranscriberApp:
         self.text_widget.config(state=tk.DISABLED)
 
         self.progress["value"] = 0
+        self.pct_label.config(text="")
         self._last_reported_pct = -1
+        self.cancel_btn.config(state=tk.NORMAL)
         self.worker_thread = threading.Thread(
             target=self._transcribe_worker,
             args=(self.file_path,),
@@ -1074,6 +1155,7 @@ class TranscriberApp:
                 file_path,
                 progress_callback=self._on_progress,
                 status_callback=self._on_status,
+                cancel_check=lambda: self._cancel_requested,
             )
             self.root.after(0, self._on_transcription_done, result)
         except Exception as exc:
@@ -1096,8 +1178,19 @@ class TranscriberApp:
     def _on_status(self, msg: str):
         self.root.after(0, lambda: self.status_var.set(msg))
 
+    def _cancel_transcription(self):
+        """Cancel the current file transcription."""
+        if not self.is_transcribing:
+            return
+        self._cancel_requested = True
+        self.status_var.set("Cancelling...")
+        self.cancel_btn.config(state=tk.DISABLED)
+        _log("Transcription cancel requested")
+
     def _on_transcription_done(self, result: dict):
         self.progress.stop()
+        self.pct_label.config(text="")
+        self.cancel_btn.config(state=tk.DISABLED)
         self.is_transcribing = False
         self._set_ui_busy(False)
 
@@ -1118,6 +1211,7 @@ class TranscriberApp:
         self.text_widget.insert("1.0", text if text else "(empty transcript)")
         self.text_widget.config(state=tk.DISABLED)
 
+        self.clear_btn.config(state=tk.NORMAL if text else tk.DISABLED)
         if text:
             self.copy_btn.config(state=tk.NORMAL)
             self.save_btn.config(state=tk.NORMAL)
@@ -1128,10 +1222,22 @@ class TranscriberApp:
 
     def _on_transcription_error(self, exc: Exception):
         self.progress.stop()
+        self.pct_label.config(text="")
+        self.cancel_btn.config(state=tk.DISABLED)
         self.is_transcribing = False
+        self._cancel_requested = False
         self._set_ui_busy(False)
 
         err_msg = str(exc)
+        if err_msg == "Cancelled":
+            self.status_var.set("Transcription cancelled.")
+            self.text_widget.config(state=tk.NORMAL)
+            self.text_widget.delete("1.0", tk.END)
+            self.text_widget.insert("1.0", "Transcription was cancelled.")
+            self.text_widget.config(state=tk.DISABLED)
+            _log("Transcription cancelled by user")
+            return
+
         self.status_var.set(f"Error: {err_msg}")
 
         self.text_widget.config(state=tk.NORMAL)
@@ -1183,6 +1289,7 @@ class TranscriberApp:
         state = tk.DISABLED if busy else tk.NORMAL
         self.select_btn.config(state=state)
         self.transcribe_btn.config(state=state)
+        self.record_btn.config(state=state if not self.is_listening else tk.DISABLED)
 
         # Keep copy/save enabled only when we have text
         if not busy and not self.transcription_text:
@@ -1200,7 +1307,8 @@ class TranscriberApp:
         self.root.destroy()
 
 
-# ---------------------------------------------------------------------------    # Startup log: write right after tkinter import so we know it worked
+# ---------------------------------------------------------------------------
+#  Startup log: write right after tkinter import so we know it worked
 # ---------------------------------------------------------------------------
 _log(f"tkinter imported OK: {tk.Tcl().eval('info patchlevel')}")
 

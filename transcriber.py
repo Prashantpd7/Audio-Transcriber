@@ -152,7 +152,7 @@ MODEL_SIZE = "large-v3"           # ~3 GB download on first run, cached locally
 
 # Live microphone constants
 LIVE_SAMPLE_RATE = 16000
-LIVE_CHUNK_SECONDS = 3             # record 3-second chunks
+LIVE_CHUNK_SECONDS = 2             # 2-second chunks for faster turnaround
 LIVE_CHUNK_SAMPLES = LIVE_SAMPLE_RATE * LIVE_CHUNK_SECONDS
 LIVE_SILENCE_THRESHOLD = 0.01      # skip chunks below this RMS
 
@@ -385,6 +385,11 @@ def transcribe_audio(
     language = getattr(info, "language", "unknown") or "unknown"
     language_prob = getattr(info, "language_probability", 0.0) or 0.0
 
+    # If Hindi was detected, transliterate to Hinglish for readability
+    if language and language.startswith("hi"):
+        _log("Hindi detected — transliterating to Hinglish")
+        formatted = _to_hinglish(formatted)
+
     _log(f"Transcription complete: lang={language}, prob={language_prob:.2%}, "
          f"duration={duration:.1f}s, segments={len(collected_segments)}")
 
@@ -442,6 +447,86 @@ def _format_transcript(segments: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+#  Hinglish transliteration — converts Devanagari Hindi text to Roman script
+# ---------------------------------------------------------------------------
+
+# Mapping for Devanagari → Roman (ITRANS-like scheme)
+_HINGLISH_MAP = {
+    # Vowels (independent)
+    'अ': 'a', 'आ': 'aa', 'इ': 'i', 'ई': 'ee',
+    'उ': 'u', 'ऊ': 'oo', 'ए': 'e', 'ऐ': 'ai',
+    'ओ': 'o', 'औ': 'au', 'अं': 'an', 'अः': 'ah',
+    # Consonants
+    'क': 'k', 'ख': 'kh', 'ग': 'g', 'घ': 'gh', 'ङ': 'ng',
+    'च': 'ch', 'छ': 'chh', 'ज': 'j', 'झ': 'jh', 'ञ': 'ny',
+    'ट': 't', 'ठ': 'th', 'ड': 'd', 'ढ': 'dh', 'ण': 'n',
+    'त': 't', 'थ': 'th', 'द': 'd', 'ध': 'dh', 'न': 'n',
+    'प': 'p', 'फ': 'ph', 'ब': 'b', 'भ': 'bh', 'म': 'm',
+    'य': 'y', 'र': 'r', 'ल': 'l', 'व': 'v',
+    'श': 'sh', 'ष': 'sh', 'स': 's', 'ह': 'h',
+    'ड़': 'd', 'ढ़': 'rh', 'क्ष': 'ksh', 'त्र': 'tr', 'ज्ञ': 'gy',
+    # Matras (vowel signs) — applied to previous consonant
+    'ा': 'aa', 'ि': 'i', 'ी': 'ee', 'ु': 'u', 'ू': 'oo',
+    'े': 'e', 'ै': 'ai', 'ो': 'o', 'ौ': 'au',
+    # Halant (removes inherent vowel)
+    '्': '',
+    # Other marks
+    'ं': 'n', 'ः': 'h', '।': '.', '॥': '..',
+}
+
+# Also map uppercase/lowercase Devanagari numerals
+_HINGLISH_NUM = {
+    '०': '0', '१': '1', '२': '2', '३': '3', '४': '4',
+    '५': '5', '६': '6', '७': '7', '८': '8', '९': '9',
+}
+
+
+def _to_hinglish(text: str) -> str:
+    """
+    Transliterate Devanagari Hindi text to Romanized Hinglish.
+
+    If the text contains Devanagari characters, they are converted
+    to a Roman script approximation.  Text that is already in Latin
+    script (English) is returned as-is.
+
+    Example: "नमस्ते दोस्तों" → "namaste doston"
+    """
+    import re as _re
+
+    # Quick check: does this text contain any Devanagari?
+    if not _re.search(r'[\u0900-\u097F]', text):
+        return text  # No Devanagari, return as-is
+
+    result = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+
+        # Try two-character sequences first (e.g., क्ष, त्र, अं)
+        if i + 1 < len(text):
+            pair = text[i:i+2]
+            if pair in _HINGLISH_MAP:
+                result.append(_HINGLISH_MAP[pair])
+                i += 2
+                continue
+
+        # Single character
+        if ch in _HINGLISH_MAP:
+            result.append(_HINGLISH_MAP[ch])
+        elif ch in _HINGLISH_NUM:
+            result.append(_HINGLISH_NUM[ch])
+        else:
+            # Pass through spaces, punctuation, English letters unchanged
+            result.append(ch)
+        i += 1
+
+    # Clean up: remove extra spaces
+    romanized = "".join(result)
+    romanized = _re.sub(r' +', ' ', romanized).strip()
+    return romanized
+
+
+# ---------------------------------------------------------------------------
 #  Live microphone transcription (chunk-based, runs in background thread)
 # ---------------------------------------------------------------------------
 
@@ -452,13 +537,15 @@ def _transcribe_chunk(audio_chunk: np.ndarray):
     Returns (text, language, language_probability) tuple.
     text may be empty for silence. language is 'unknown' on failure.
     Designed to be called from the live-listening worker thread.
+
+    Uses greedy decoding (beam_size=1) for maximum speed.
     """
     with _model_lock:
         try:
             segments, info = _model.transcribe(
                 audio_chunk,
-                beam_size=3,             # faster for live
-                best_of=3,
+                beam_size=1,             # greedy = fastest possible
+                best_of=1,
                 temperature=0.0,
                 vad_filter=True,
                 vad_parameters=dict(
@@ -472,7 +559,10 @@ def _transcribe_chunk(audio_chunk: np.ndarray):
             texts = [seg.text.strip() for seg in segments if seg.text.strip()]
             language = getattr(info, "language", "unknown") or "unknown"
             language_prob = getattr(info, "language_probability", 0.0) or 0.0
-            return " ".join(texts), language, language_prob
+            raw_text = " ".join(texts)
+            # Transliterate Hindi to Hinglish if needed
+            hinglish_text = _to_hinglish(raw_text)
+            return hinglish_text, language, language_prob
         except Exception as _e:
             _log(f"Live transcribe chunk error: {_e}")
             _log(f"Traceback:\n{_traceback.format_exc()}")
@@ -670,11 +760,11 @@ class TranscriberApp:
         self.text_widget = tk.Text(
             text_frame,
             wrap=tk.WORD,
-            font=("Helvetica", 11),
+            font=("Helvetica", 12),
             relief=tk.FLAT,
             borderwidth=0,
-            padx=8,
-            pady=8,
+            padx=10,
+            pady=10,
             bg="#fafafa",
             fg="#222",
             state=tk.DISABLED,
@@ -686,7 +776,7 @@ class TranscriberApp:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.text_widget.configure(yscrollcommand=scrollbar.set)
 
-        # Give the Transcribe button a distinct accent colour
+        # Give the Transcribe button a distinct accent colour with hover effect
         style.configure(
             "Accent.TButton",
             font=("Helvetica", 10, "bold"),
@@ -698,7 +788,19 @@ class TranscriberApp:
         )
         style.map(
             "Accent.TButton",
-            background=[("disabled", "#94a3b8")],
+            background=[("active", "#1d4ed8"), ("!active", "#2563eb"), ("disabled", "#94a3b8")],
+            foreground=[("disabled", "#e2e8f0")],
+        )
+
+        # Hover effects for all styled buttons
+        style.map(
+            "Listen.TButton",
+            background=[("active", "#047857"), ("!active", "#059669"), ("disabled", "#94a3b8")],
+            foreground=[("disabled", "#e2e8f0")],
+        )
+        style.map(
+            "Stop.TButton",
+            background=[("active", "#b91c1c"), ("!active", "#dc2626"), ("disabled", "#94a3b8")],
             foreground=[("disabled", "#e2e8f0")],
         )
 

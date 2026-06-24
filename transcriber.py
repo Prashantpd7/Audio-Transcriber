@@ -154,7 +154,7 @@ MODEL_SIZE = "large-v3"
 LIVE_SAMPLE_RATE = 16000
 LIVE_CHUNK_SECONDS = 2
 LIVE_CHUNK_SAMPLES = LIVE_SAMPLE_RATE * LIVE_CHUNK_SECONDS
-LIVE_SILENCE_THRESHOLD = 0.003     # lower threshold to catch quieter speech
+LIVE_SILENCE_THRESHOLD = 0.001     # lower threshold for quieter speech
 
 SUPPORTED_EXTENSIONS = (
     ".mp3", ".mp4", ".wav", ".m4a", ".aac",
@@ -528,9 +528,7 @@ def _to_hinglish(text: str) -> str:
 
 # ---------------------------------------------------------------------------
 #  Live microphone transcription (chunk-based, runs in background thread)
-# ---------------------------------------------------------------------------
-
-def _transcribe_chunk(audio_chunk: np.ndarray):
+# ---------------------------------------------------------------------------    def _transcribe_chunk(audio_chunk: np.ndarray):
     """
     Transcribe a short audio chunk using the shared model.
 
@@ -539,28 +537,25 @@ def _transcribe_chunk(audio_chunk: np.ndarray):
     Designed to be called from the live-listening worker thread.
 
     Uses greedy decoding (beam_size=1) for maximum speed.
+    VAD is NOT applied here — silence detection happens before calling this.
     """
     with _model_lock:
         try:
             segments, info = _model.transcribe(
                 audio_chunk,
-                beam_size=1,             # greedy = fastest possible
+                beam_size=1,
                 best_of=1,
                 temperature=0.0,
-                vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=300,
-                    threshold=0.5,
-                ),
-                condition_on_previous_text=False,  # don't bias from previous chunk
+                vad_filter=False,          # silence already pre-filtered
+                condition_on_previous_text=False,
                 no_speech_threshold=0.6,
-                # NO language= parameter → auto-detect (hi, en, etc.)
+                log_prob_threshold=-1.0,
+                compression_ratio_threshold=2.4,
             )
             texts = [seg.text.strip() for seg in segments if seg.text.strip()]
             language = getattr(info, "language", "unknown") or "unknown"
             language_prob = getattr(info, "language_probability", 0.0) or 0.0
             raw_text = " ".join(texts)
-            # Transliterate Hindi to Hinglish if needed
             hinglish_text = _to_hinglish(raw_text)
             return hinglish_text, language, language_prob
         except Exception as _e:
@@ -658,9 +653,14 @@ class TranscriberApp:
         ).pack(side=tk.LEFT)
 
         self.progress = ttk.Progressbar(
-            progress_frame, mode="determinate", length=150
+            progress_frame, mode="determinate", length=120
         )
-        self.progress.pack(side=tk.RIGHT, padx=(12, 0))
+        self.progress.pack(side=tk.RIGHT, padx=(4, 0))
+
+        self.pct_label = ttk.Label(
+            progress_frame, text="", font=("Helvetica", 9), foreground="#2563eb", width=5
+        )
+        self.pct_label.pack(side=tk.RIGHT)
 
         # --- Info row: language + elapsed time ---
         info_frame = ttk.Frame(self.root, padding=(12, 0, 12, 2))
@@ -824,14 +824,12 @@ class TranscriberApp:
         self.select_btn.config(state=tk.DISABLED)
         self.transcribe_btn.config(state=tk.DISABLED)
 
-        # Clear previous transcription and show placeholder
+        # Keep existing transcript — append separator to UI placeholder
         self.text_widget.config(state=tk.NORMAL)
-        self.text_widget.delete("1.0", tk.END)
-        self.text_widget.insert("1.0", "Listening... (speak now)\n")
+        self.text_widget.see(tk.END)
+        self.text_widget.insert(tk.END, "\nListening... (speak now)\n")
+        self.text_widget.see(tk.END)
         self.text_widget.config(state=tk.DISABLED)
-        self.transcription_text = ""
-        self.copy_btn.config(state=tk.DISABLED)
-        self.save_btn.config(state=tk.DISABLED)
 
         self.live_start_time = time.time()
         self.status_var.set("Listening...")
@@ -846,18 +844,16 @@ class TranscriberApp:
         self.live_thread.start()
 
     def _stop_recording(self):
-        """Stop recording and show the Stop button as Record."""
+        """Stop recording. Show 'Transcribing...' until last chunk finishes."""
         if not self.is_listening:
             return
         self.is_listening = False
         self.live_stop.set()
         self._stop_timer()
         self.record_btn.config(text="Record", style="Record.TButton")
-        self.status_var.set("Stopped.")
-        if self.transcription_text:
-            self.copy_btn.config(state=tk.NORMAL)
-            self.save_btn.config(state=tk.NORMAL)
-            self.clear_btn.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se")
+        # Show "Transcribing..." while worker finishes its last chunk
+        self.status_var.set("Transcribing remaining audio...")
+        _log("Stop requested — waiting for worker to finish last chunk")
 
     def _clear_transcript(self):
         """Clear the transcript text area."""
@@ -891,7 +887,10 @@ class TranscriberApp:
             if default_input is None or default_input < 0:
                 raise RuntimeError("No input microphone found.")
 
-            continuous_text = ""
+            # Start from existing transcript so re-recording preserves old text
+            continuous_text = self.transcription_text or ""
+            if continuous_text:
+                continuous_text += "\n\n--- New Recording ---\n\n"
 
             while not self.live_stop.is_set():
                 # Record a chunk
@@ -983,6 +982,7 @@ class TranscriberApp:
         self.record_btn.config(text="Record", style="Record.TButton")
         self.select_btn.config(state=tk.NORMAL)
         self.transcribe_btn.config(state=tk.NORMAL)
+        self.status_var.set("Stopped.")
         if self.transcription_text:
             self.clear_btn.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se")
             self.copy_btn.config(state=tk.NORMAL)
@@ -1090,6 +1090,7 @@ class TranscriberApp:
 
     def _update_progress_ui(self, pct: int):
         self.progress["value"] = pct
+        self.pct_label.config(text=f"{pct}%")
         self.status_var.set(f"Transcribing… {pct}%")
 
     def _on_status(self, msg: str):

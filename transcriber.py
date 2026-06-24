@@ -675,29 +675,28 @@ class TranscriberApp:
             status_frame, textvariable=self.status_var, font=("Helvetica", 9)
         ).pack(anchor=tk.W)
 
-        # Row 2: progress bar + % label + cancel ✕
+        # Row 2: progress bar + cancel ✕ (no separate % label — percentage is in status text above)
         bar_frame = ttk.Frame(self.root, padding=(12, 1, 12, 2))
         bar_frame.pack(fill=tk.X)
 
         self.progress = ttk.Progressbar(
             bar_frame, mode="determinate"
         )
-        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        self.pct_label = ttk.Label(
-            bar_frame, text="", font=("Helvetica", 9), foreground="#2563eb", width=4
-        )
-        self.pct_label.pack(side=tk.LEFT, padx=(6, 0))
+        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=2)
 
         # Cancel "✕" — plain label, no box/background/border, just red text
+        # Use same background as the app window to avoid any visible rectangle
         self.cancel_lbl = tk.Label(
             bar_frame,
-            text="  ✕",
+            text="  ✕  ",
             fg="#dc2626",
-            font=("Helvetica", 11, "bold"),
+            font=("Helvetica", 10, "bold"),
             cursor="hand2",
+            relief=tk.FLAT,
+            highlightthickness=0,
+            bd=0,
         )
-        self.cancel_lbl.pack(side=tk.LEFT, padx=(8, 0))
+        self.cancel_lbl.pack(side=tk.LEFT, padx=(2, 0), pady=2)
         self.cancel_lbl.bind("<Button-1>", lambda _: self._cancel_transcription())
         self.cancel_lbl.pack_forget()  # hidden until transcription starts
 
@@ -1149,9 +1148,8 @@ class TranscriberApp:
         self.text_widget.config(state=tk.DISABLED)
 
         self.progress["value"] = 0
-        self.pct_label.config(text="")
         self._last_reported_pct = -1
-        self.cancel_lbl.pack(side=tk.LEFT, padx=(8, 0))  # show cancel button
+        self.cancel_lbl.pack(side=tk.LEFT, padx=(2, 0), pady=2)  # show cancel button
         self.worker_thread = threading.Thread(
             target=self._transcribe_worker,
             args=(self.file_path,),
@@ -1182,7 +1180,6 @@ class TranscriberApp:
 
     def _update_progress_ui(self, pct: int):
         self.progress["value"] = pct
-        self.pct_label.config(text=f"{pct}%")
         self.status_var.set(f"Transcribing… {pct}%")
 
     def _on_status(self, msg: str):
@@ -1199,7 +1196,6 @@ class TranscriberApp:
 
     def _on_transcription_done(self, result: dict):
         self.progress.stop()
-        self.pct_label.config(text="")
         self.cancel_lbl.pack_forget()
         self.is_transcribing = False
         self._set_ui_busy(False)
@@ -1232,7 +1228,6 @@ class TranscriberApp:
 
     def _on_transcription_error(self, exc: Exception):
         self.progress.stop()
-        self.pct_label.config(text="")
         self.cancel_lbl.pack_forget()
         self.is_transcribing = False
         self._cancel_requested = False

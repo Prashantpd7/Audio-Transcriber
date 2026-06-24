@@ -606,6 +606,8 @@ class TranscriberApp:
         self.is_transcribing = False
         self.worker_thread: threading.Thread | None = None
         self._cancel_requested = False
+        self._cancel_gen = 0
+        self._worker_gen = 0
 
         # Live microphone state
         self.is_listening = False
@@ -682,22 +684,32 @@ class TranscriberApp:
         self.progress = ttk.Progressbar(
             bar_frame, mode="determinate"
         )
-        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=2)
+        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Cancel "✕" — plain label, no box/background/border, just red text
-        # Use same background as the app window to avoid any visible rectangle
+        # Cancel "✕" — styled as a proper clickable area
+        # Fixed width (32px), centered ✕, same height as progress bar, hover effect
         self.cancel_lbl = tk.Label(
             bar_frame,
-            text="  ✕  ",
+            text="✕",
             fg="#dc2626",
-            font=("Helvetica", 10, "bold"),
+            font=("Helvetica", 15, "bold"),
             cursor="hand2",
+            width=3,
+            anchor=tk.CENTER,
             relief=tk.FLAT,
-            highlightthickness=0,
             bd=0,
+            highlightthickness=0,
+            padx=0,
+            pady=0,
         )
-        self.cancel_lbl.pack(side=tk.LEFT, padx=(2, 0), pady=2)
-        self.cancel_lbl.bind("<Button-1>", lambda _: self._cancel_transcription())
+        # Match parent frame background so there's no visible rectangle
+        _bar_bg = bar_frame.cget("background")
+        self.cancel_lbl.config(bg=_bar_bg)
+        self.cancel_lbl.pack(side=tk.LEFT, padx=(4, 0))
+        self.cancel_lbl.bind("<Button-1>", lambda e: self._cancel_transcription())
+        # Hover effect: light red background on enter, restore on leave
+        self.cancel_lbl.bind("<Enter>", lambda e: self.cancel_lbl.config(bg="#fde8e8"))
+        self.cancel_lbl.bind("<Leave>", lambda e: self.cancel_lbl.config(bg=_bar_bg))
         self.cancel_lbl.pack_forget()  # hidden until transcription starts
 
         # --- Info row: language + elapsed time ---
@@ -1140,6 +1152,7 @@ class TranscriberApp:
 
         self.is_transcribing = True
         self._cancel_requested = False
+        self._worker_gen = self._cancel_gen  # capture generation for stale-worker guard
         self._set_ui_busy(True)
 
         self.text_widget.config(state=tk.NORMAL)
@@ -1186,15 +1199,29 @@ class TranscriberApp:
         self.root.after(0, lambda: self.status_var.set(msg))
 
     def _cancel_transcription(self):
-        """Cancel the current file transcription."""
+        """Cancel the current file transcription immediately."""
         if not self.is_transcribing:
             return
         self._cancel_requested = True
-        self.status_var.set("Cancelling...")
+        self._cancel_gen += 1  # invalidate any stale worker completions
+        _log(f"Transcription cancel requested (gen={self._cancel_gen})")
+        # Immediately clear the UI so cancellation is instant
+        self.progress["value"] = 0
         self.cancel_lbl.pack_forget()
-        _log("Transcription cancel requested")
+        self.is_transcribing = False
+        self._set_ui_busy(False)
+        self.status_var.set("Transcription cancelled.")
+        self.text_widget.config(state=tk.NORMAL)
+        self.text_widget.delete("1.0", tk.END)
+        self.text_widget.insert("1.0", "Transcription was cancelled.")
+        self.text_widget.config(state=tk.DISABLED)
+        # Stale worker thread will finish and call the completion handler,
+        # which compares _cancel_gen vs _worker_gen to skip stale completions.
 
     def _on_transcription_done(self, result: dict):
+        # Stale worker guard: if _cancel_gen changed since this worker started, skip
+        if self._cancel_gen != self._worker_gen:
+            return
         self.progress.stop()
         self.cancel_lbl.pack_forget()
         self.is_transcribing = False
@@ -1227,10 +1254,12 @@ class TranscriberApp:
             self.lang_var.set("")
 
     def _on_transcription_error(self, exc: Exception):
+        # Stale worker guard: if _cancel_gen changed since this worker started, skip
+        if self._cancel_gen != self._worker_gen:
+            return
         self.progress.stop()
         self.cancel_lbl.pack_forget()
         self.is_transcribing = False
-        self._cancel_requested = False
         self._set_ui_busy(False)
 
         err_msg = str(exc)

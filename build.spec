@@ -288,7 +288,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="Audio Transcriber.app",
-    icon=None,
+    icon="AppIcon.icns",
     display_name="Audio Transcriber",
     version="1.0.0",
     bundle_identifier="com.audiotranscriber.app",
@@ -297,8 +297,7 @@ app = BUNDLE(
         "CFBundleVersion": "1.0.0",
         "NSHumanReadableCopyright": "© 2026 Audio Transcriber",
         "LSMinimumSystemVersion": "11.0",
-        # LSUIElement intentionally OMITTED – user wants a normal app
-        # with a Dock icon and standard window management.
         "NSHighResolutionCapable": True,
+        "NSMicrophoneUsageDescription": "Audio Transcriber needs microphone access to transcribe speech in real time.",
     },
 )

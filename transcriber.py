@@ -147,14 +147,14 @@ def _dir_size(path: str) -> str:
 #  Constants
 # ---------------------------------------------------------------------------
 APP_TITLE = "Audio Transcriber"
-APP_SIZE = "860x740"              # taller to fit live controls
-MODEL_SIZE = "large-v3"           # ~3 GB download on first run, cached locally
+APP_SIZE = "860x700"
+MODEL_SIZE = "large-v3"
 
 # Live microphone constants
 LIVE_SAMPLE_RATE = 16000
-LIVE_CHUNK_SECONDS = 2             # 2-second chunks for faster turnaround
+LIVE_CHUNK_SECONDS = 2
 LIVE_CHUNK_SAMPLES = LIVE_SAMPLE_RATE * LIVE_CHUNK_SECONDS
-LIVE_SILENCE_THRESHOLD = 0.01      # skip chunks below this RMS
+LIVE_SILENCE_THRESHOLD = 0.003     # lower threshold to catch quieter speech
 
 SUPPORTED_EXTENSIONS = (
     ".mp3", ".mp4", ".wav", ".m4a", ".aac",
@@ -580,7 +580,7 @@ class TranscriberApp:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry(APP_SIZE)
-        self.root.minsize(640, 600)
+        self.root.minsize(640, 560)
 
         # Prevent the window from being closed while transcribing
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -606,48 +606,61 @@ class TranscriberApp:
         style = ttk.Style()
         style.theme_use("clam")
 
-        # --- Top frame: file selection ---
-        top_frame = ttk.Frame(self.root, padding=12)
-        top_frame.pack(fill=tk.X)
+        # --- Top: title only (no subtitle) ---
+        title_frame = ttk.Frame(self.root, padding=(12, 12, 12, 0))
+        title_frame.pack(fill=tk.X)
 
-        ttk.Label(top_frame, text="Audio Transcriber", font=("Helvetica", 18, "bold")).pack(
-            anchor=tk.W, pady=(0, 2)
-        )
         ttk.Label(
-            top_frame,
-            text="Local transcription using Faster‑Whisper — fully offline after setup.",
-            foreground="#666",
-            font=("Helvetica", 10),
-        ).pack(anchor=tk.W, pady=(0, 10))
+            title_frame, text="Audio Transcriber",
+            font=("Helvetica", 18, "bold")
+        ).pack(anchor=tk.W)
 
-        # Row: select button + file label
-        select_row = ttk.Frame(top_frame)
-        select_row.pack(fill=tk.X)
+        # --- Action buttons row 1: Select, Transcribe File, Record ---
+        action_row1 = ttk.Frame(self.root, padding=(12, 6, 12, 2))
+        action_row1.pack(fill=tk.X)
 
         self.select_btn = ttk.Button(
-            select_row, text="Select Audio", command=self._select_file
+            action_row1, text="Select File", command=self._select_file
         )
-        self.select_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.select_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         self.file_label = ttk.Label(
-            select_row, text="No file selected", foreground="#888"
+            action_row1, text="No file selected", foreground="#888",
+            font=("Helvetica", 10)
         )
         self.file_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+        self.transcribe_btn = ttk.Button(
+            action_row1,
+            text="Transcribe File",
+            command=self._start_transcription,
+            style="Accent.TButton",
+            width=16,
+        )
+        self.transcribe_btn.pack(side=tk.LEFT, padx=(6, 6))
+
+        self.record_btn = ttk.Button(
+            action_row1,
+            text="Record",
+            command=self._toggle_record,
+            style="Record.TButton",
+            width=12,
+        )
+        self.record_btn.pack(side=tk.LEFT)
+
         # --- Status / progress ---
-        progress_frame = ttk.Frame(self.root, padding=(12, 0, 12, 4))
+        progress_frame = ttk.Frame(self.root, padding=(12, 2, 12, 2))
         progress_frame.pack(fill=tk.X)
 
         self.status_var = tk.StringVar(value="Ready")
-        status_label = ttk.Label(
+        ttk.Label(
             progress_frame, textvariable=self.status_var, font=("Helvetica", 9)
-        )
-        status_label.pack(anchor=tk.W)
+        ).pack(side=tk.LEFT)
 
         self.progress = ttk.Progressbar(
-            progress_frame, mode="determinate", length=200
+            progress_frame, mode="determinate", length=150
         )
-        self.progress.pack(fill=tk.X, pady=(4, 0))
+        self.progress.pack(side=tk.RIGHT, padx=(12, 0))
 
         # --- Info row: language + elapsed time ---
         info_frame = ttk.Frame(self.root, padding=(12, 0, 12, 2))
@@ -665,102 +678,43 @@ class TranscriberApp:
             font=("Helvetica", 9), foreground="#2563eb"
         ).pack(side=tk.RIGHT)
 
-        # --- Action buttons row 1: file mode ---
-        action_frame = ttk.Frame(self.root, padding=(12, 4, 12, 2))
-        action_frame.pack(fill=tk.X)
-
-        self.transcribe_btn = ttk.Button(
-            action_frame,
-            text="Transcribe File",
-            command=self._start_transcription,
-            style="Accent.TButton",
-        )
-        self.transcribe_btn.pack(side=tk.LEFT, padx=(0, 6))
+        # --- Action buttons row 2: Copy, Save ---
+        action_row2 = ttk.Frame(self.root, padding=(12, 2, 12, 4))
+        action_row2.pack(fill=tk.X)
 
         self.copy_btn = ttk.Button(
-            action_frame,
+            action_row2,
             text="Copy Transcript",
             command=self._copy_text,
             state=tk.DISABLED,
+            width=16,
         )
-        self.copy_btn.pack(side=tk.LEFT, padx=6)
+        self.copy_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         self.save_btn = ttk.Button(
-            action_frame,
+            action_row2,
             text="Save Transcript",
             command=self._save_text,
             state=tk.DISABLED,
+            width=16,
         )
-        self.save_btn.pack(side=tk.LEFT, padx=6)
+        self.save_btn.pack(side=tk.LEFT)
 
-        # --- Action buttons row 2: live mode ---
-        live_frame = ttk.Frame(self.root, padding=(12, 2, 12, 4))
-        live_frame.pack(fill=tk.X)
-
-        style.configure(
-            "Listen.TButton",
-            font=("Helvetica", 10, "bold"),
-            foreground="white",
-            background="#059669",
-            bordercolor="#047857",
-            lightcolor="#10b981",
-            darkcolor="#065f46",
-        )
-        style.map(
-            "Listen.TButton",
-            background=[("disabled", "#94a3b8")],
-            foreground=[("disabled", "#e2e8f0")],
-        )
-        style.configure(
-            "Stop.TButton",
-            font=("Helvetica", 10, "bold"),
-            foreground="white",
-            background="#dc2626",
-            bordercolor="#b91c1c",
-            lightcolor="#ef4444",
-            darkcolor="#991b1b",
-        )
-        style.map(
-            "Stop.TButton",
-            background=[("disabled", "#94a3b8")],
-            foreground=[("disabled", "#e2e8f0")],
-        )
-
-        self.listen_btn = ttk.Button(
-            live_frame,
-            text="🎤  Start Listening",
-            command=self._start_listening,
-            style="Listen.TButton",
-        )
-        self.listen_btn.pack(side=tk.LEFT, padx=(0, 6))
-
-        self.stop_btn = ttk.Button(
-            live_frame,
-            text="⏹  Stop",
-            command=self._stop_listening,
-            state=tk.DISABLED,
-            style="Stop.TButton",
-        )
-        self.stop_btn.pack(side=tk.LEFT, padx=6)
-
-        self.clear_btn = ttk.Button(
-            live_frame,
-            text="🗑  Clear Transcript",
-            command=self._clear_transcript,
-        )
-        self.clear_btn.pack(side=tk.LEFT, padx=6)
-
-        # Separator between controls and text area
+        # Separator
         ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=12)
 
-        # --- Transcript text area ---
+        # --- Transcript text area with embedded Clear button ---
         text_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
         text_frame.pack(fill=tk.BOTH, expand=True)
 
+        # Inner frame for text + Clear button overlay
+        text_inner = tk.Frame(text_frame, bg="#fafafa", highlightthickness=0)
+        text_inner.pack(fill=tk.BOTH, expand=True)
+
         self.text_widget = tk.Text(
-            text_frame,
+            text_inner,
             wrap=tk.WORD,
-            font=("Helvetica", 12),
+            font=("Helvetica", 13),
             relief=tk.FLAT,
             borderwidth=0,
             padx=10,
@@ -772,11 +726,21 @@ class TranscriberApp:
         self.text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # Scrollbar
-        scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.text_widget.yview)
+        scrollbar = ttk.Scrollbar(text_inner, orient=tk.VERTICAL, command=self.text_widget.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.text_widget.configure(yscrollcommand=scrollbar.set)
 
-        # Give the Transcribe button a distinct accent colour with hover effect
+        # Clear button at bottom-right — hidden until there's text
+        self.clear_btn = ttk.Button(
+            text_inner,
+            text="Clear",
+            command=self._clear_transcript,
+            width=8,
+        )
+        self.clear_btn.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se")
+        self.clear_btn.place_forget()  # hidden initially
+
+        # --- Button styles (all uniform) ---
         style.configure(
             "Accent.TButton",
             font=("Helvetica", 10, "bold"),
@@ -791,17 +755,37 @@ class TranscriberApp:
             background=[("active", "#1d4ed8"), ("!active", "#2563eb"), ("disabled", "#94a3b8")],
             foreground=[("disabled", "#e2e8f0")],
         )
-
-        # Hover effects for all styled buttons
+        style.configure(
+            "Record.TButton",
+            font=("Helvetica", 10, "bold"),
+            foreground="white",
+            background="#059669",
+            bordercolor="#047857",
+            lightcolor="#10b981",
+            darkcolor="#065f46",
+        )
         style.map(
-            "Listen.TButton",
+            "Record.TButton",
             background=[("active", "#047857"), ("!active", "#059669"), ("disabled", "#94a3b8")],
             foreground=[("disabled", "#e2e8f0")],
         )
+        style.configure(
+            "StopRecord.TButton",
+            font=("Helvetica", 10, "bold"),
+            foreground="white",
+            background="#dc2626",
+            bordercolor="#b91c1c",
+            lightcolor="#ef4444",
+            darkcolor="#991b1b",
+        )
         style.map(
-            "Stop.TButton",
+            "StopRecord.TButton",
             background=[("active", "#b91c1c"), ("!active", "#dc2626"), ("disabled", "#94a3b8")],
             foreground=[("disabled", "#e2e8f0")],
+        )
+        style.configure(
+            "Clear.TButton",
+            font=("Helvetica", 9),
         )
 
         # Keyboard shortcuts
@@ -809,14 +793,20 @@ class TranscriberApp:
         self.root.bind("<Command-t>", lambda _: self._start_transcription())
         self.root.bind("<Command-c>", lambda _: self._copy_text())
         self.root.bind("<Command-s>", lambda _: self._save_text())
-        self.root.bind("<Command-l>", lambda _: self._start_listening())
-        self.root.bind("<Command-.>", lambda _: self._stop_listening())
-        self.root.bind("<Command-Escape>", lambda _: self._stop_listening())
+        self.root.bind("<Command-r>", lambda _: self._toggle_record())
+        self.root.bind("<Command-Escape>", lambda _: self._toggle_record() if self.is_listening else None)
 
     # ── Live microphone transcription ─────────────────────────────────
 
-    def _start_listening(self):
-        """Start live microphone transcription in a background thread."""
+    def _toggle_record(self):
+        """Toggle between Record and Stop states."""
+        if self.is_listening:
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    def _start_recording(self):
+        """Start recording and transcribing from the microphone."""
         if self.is_listening or self.is_transcribing:
             return
 
@@ -829,24 +819,24 @@ class TranscriberApp:
 
         self.is_listening = True
         self.live_stop.clear()
-        self.listen_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
-        self.clear_btn.config(state=tk.DISABLED)
+        self.record_btn.config(text="Stop", style="StopRecord.TButton")
+        self.clear_btn.place_forget()  # hide Clear during recording
         self.select_btn.config(state=tk.DISABLED)
         self.transcribe_btn.config(state=tk.DISABLED)
 
         # Clear previous transcription and show placeholder
         self.text_widget.config(state=tk.NORMAL)
         self.text_widget.delete("1.0", tk.END)
-        self.text_widget.insert("1.0", "Listening… (speak now)\n")
+        self.text_widget.insert("1.0", "Listening... (speak now)\n")
         self.text_widget.config(state=tk.DISABLED)
         self.transcription_text = ""
         self.copy_btn.config(state=tk.DISABLED)
         self.save_btn.config(state=tk.DISABLED)
 
         self.live_start_time = time.time()
-        self.status_var.set("Listening…")
+        self.status_var.set("Listening...")
         self.lang_var.set("")
+        _log("Live recording started — waiting for audio chunks")
         self._start_timer()
 
         self.live_thread = threading.Thread(
@@ -855,18 +845,19 @@ class TranscriberApp:
         )
         self.live_thread.start()
 
-    def _stop_listening(self):
-        """Stop the live microphone transcription."""
+    def _stop_recording(self):
+        """Stop recording and show the Stop button as Record."""
         if not self.is_listening:
             return
         self.is_listening = False
         self.live_stop.set()
         self._stop_timer()
-
-        self.status_var.set("Stopped listening.")
+        self.record_btn.config(text="Record", style="Record.TButton")
+        self.status_var.set("Stopped.")
         if self.transcription_text:
             self.copy_btn.config(state=tk.NORMAL)
             self.save_btn.config(state=tk.NORMAL)
+            self.clear_btn.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se")
 
     def _clear_transcript(self):
         """Clear the transcript text area."""
@@ -880,6 +871,7 @@ class TranscriberApp:
         self.save_btn.config(state=tk.DISABLED)
         self.status_var.set("Transcript cleared.")
         self.lang_var.set("")
+        self.clear_btn.place_forget()
 
     def _live_listen_worker(self):
         """
@@ -921,14 +913,20 @@ class TranscriberApp:
                 audio = recording.flatten()
 
                 # Check for silence — skip if max amplitude is below threshold
-                if np.max(np.abs(audio)) < LIVE_SILENCE_THRESHOLD:
+                rms = np.sqrt(np.mean(audio ** 2))
+                peak = np.max(np.abs(audio))
+                _log(f"Chunk: RMS={rms:.6f}, peak={peak:.6f}, threshold={LIVE_SILENCE_THRESHOLD}")
+                if peak < LIVE_SILENCE_THRESHOLD:
+                    _log("  -> below threshold, skipping")
                     continue
 
-                # Show "Processing…" status while transcribing
-                self.root.after(0, lambda: self.status_var.set("Processing…"))
+                # Show "Processing..." status while transcribing
+                self.root.after(0, lambda: self.status_var.set("Processing..."))
 
                 # Transcribe the chunk
+                _log(f"  -> transcribing...")
                 text, lang, lang_prob = _transcribe_chunk(audio)
+                _log(f"  -> result: text_len={len(text)}, lang={lang}")
                 if text:
                     if continuous_text:
                         continuous_text += " " + text
@@ -938,7 +936,7 @@ class TranscriberApp:
                     self.root.after(0, self._on_live_text, continuous_text, lang, lang_prob)
                 else:
                     # No speech detected in this chunk — restore listening status
-                    self.root.after(0, lambda: self.status_var.set("Listening…"))
+                    self.root.after(0, lambda: self.status_var.set("Listening..."))
 
             _log(f"Live listen worker stopped. Final length: {len(continuous_text)} chars")
 
@@ -970,7 +968,7 @@ class TranscriberApp:
             prob_pct = f"{lang_prob * 100:.0f}%" if lang_prob else "—"
             self.lang_var.set(f"Detected: {lang} ({prob_pct})")
         # Restore listening status after processing
-        self.status_var.set("Listening…" if self.is_listening else "Ready")
+        self.status_var.set("Listening..." if self.is_listening else "Ready")
 
     def _on_live_error(self, err_msg: str):
         """Called from main thread on live transcription error."""
@@ -982,12 +980,11 @@ class TranscriberApp:
     def _on_live_stopped(self):
         """Called from main thread after live worker finishes."""
         self.is_listening = False
-        self.listen_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
-        self.clear_btn.config(state=tk.NORMAL)
+        self.record_btn.config(text="Record", style="Record.TButton")
         self.select_btn.config(state=tk.NORMAL)
         self.transcribe_btn.config(state=tk.NORMAL)
         if self.transcription_text:
+            self.clear_btn.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se")
             self.copy_btn.config(state=tk.NORMAL)
             self.save_btn.config(state=tk.NORMAL)
 
@@ -1193,10 +1190,11 @@ class TranscriberApp:
 
     def _on_close(self):
         if self.is_transcribing or self.is_listening:
-            msg = "Transcription is in progress. Quit anyway?" if self.is_transcribing else "Listening is in progress. Quit anyway?"
+            msg = "Transcription in progress. Quit anyway?" if self.is_transcribing else "Recording in progress. Quit anyway?"
             if not messagebox.askyesno("Quit?", msg):
                 return
-        self.live_stop.set()
+        if self.is_listening:
+            self.live_stop.set()
         self._stop_timer()
         self.root.destroy()
 

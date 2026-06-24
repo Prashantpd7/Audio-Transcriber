@@ -147,8 +147,14 @@ def _dir_size(path: str) -> str:
 #  Constants
 # ---------------------------------------------------------------------------
 APP_TITLE = "Audio Transcriber"
-APP_SIZE = "820x660"
-MODEL_SIZE = "large-v3"         # ~3 GB download on first run, cached locally
+APP_SIZE = "860x740"              # taller to fit live controls
+MODEL_SIZE = "large-v3"           # ~3 GB download on first run, cached locally
+
+# Live microphone constants
+LIVE_SAMPLE_RATE = 16000
+LIVE_CHUNK_SECONDS = 3             # record 3-second chunks
+LIVE_CHUNK_SAMPLES = LIVE_SAMPLE_RATE * LIVE_CHUNK_SECONDS
+LIVE_SILENCE_THRESHOLD = 0.01      # skip chunks below this RMS
 
 SUPPORTED_EXTENSIONS = (
     ".mp3", ".mp4", ".wav", ".m4a", ".aac",
@@ -436,6 +442,44 @@ def _format_transcript(segments: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+#  Live microphone transcription (chunk-based, runs in background thread)
+# ---------------------------------------------------------------------------
+
+def _transcribe_chunk(audio_chunk: np.ndarray):
+    """
+    Transcribe a short audio chunk using the shared model.
+
+    Returns (text, language, language_probability) tuple.
+    text may be empty for silence. language is 'unknown' on failure.
+    Designed to be called from the live-listening worker thread.
+    """
+    with _model_lock:
+        try:
+            segments, info = _model.transcribe(
+                audio_chunk,
+                beam_size=3,             # faster for live
+                best_of=3,
+                temperature=0.0,
+                vad_filter=True,
+                vad_parameters=dict(
+                    min_silence_duration_ms=300,
+                    threshold=0.5,
+                ),
+                condition_on_previous_text=False,  # don't bias from previous chunk
+                no_speech_threshold=0.6,
+                # NO language= parameter → auto-detect (hi, en, etc.)
+            )
+            texts = [seg.text.strip() for seg in segments if seg.text.strip()]
+            language = getattr(info, "language", "unknown") or "unknown"
+            language_prob = getattr(info, "language_probability", 0.0) or 0.0
+            return " ".join(texts), language, language_prob
+        except Exception as _e:
+            _log(f"Live transcribe chunk error: {_e}")
+            _log(f"Traceback:\n{_traceback.format_exc()}")
+            return "", "unknown", 0.0
+
+
+# ---------------------------------------------------------------------------
 #  GUI
 # ---------------------------------------------------------------------------
 class TranscriberApp:
@@ -446,7 +490,7 @@ class TranscriberApp:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry(APP_SIZE)
-        self.root.minsize(640, 520)
+        self.root.minsize(640, 600)
 
         # Prevent the window from being closed while transcribing
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -455,6 +499,13 @@ class TranscriberApp:
         self.transcription_text: str = ""
         self.is_transcribing = False
         self.worker_thread: threading.Thread | None = None
+
+        # Live microphone state
+        self.is_listening = False
+        self.live_thread: threading.Thread | None = None
+        self.live_stop = threading.Event()
+        self.live_start_time: float = 0.0
+        self._timer_job: str | None = None
 
         self._build_ui()
 
@@ -508,21 +559,29 @@ class TranscriberApp:
         )
         self.progress.pack(fill=tk.X, pady=(4, 0))
 
-        # --- Language detection info ---
-        self.lang_var = tk.StringVar(value="")
-        lang_label = ttk.Label(
-            progress_frame, textvariable=self.lang_var,
-            font=("Helvetica", 9), foreground="#555"
-        )
-        lang_label.pack(anchor=tk.W, pady=(2, 0))
+        # --- Info row: language + elapsed time ---
+        info_frame = ttk.Frame(self.root, padding=(12, 0, 12, 2))
+        info_frame.pack(fill=tk.X)
 
-        # --- Action buttons row ---
-        action_frame = ttk.Frame(self.root, padding=(12, 4, 12, 4))
+        self.lang_var = tk.StringVar(value="")
+        ttk.Label(
+            info_frame, textvariable=self.lang_var,
+            font=("Helvetica", 9), foreground="#555"
+        ).pack(side=tk.LEFT)
+
+        self.timer_var = tk.StringVar(value="")
+        ttk.Label(
+            info_frame, textvariable=self.timer_var,
+            font=("Helvetica", 9), foreground="#2563eb"
+        ).pack(side=tk.RIGHT)
+
+        # --- Action buttons row 1: file mode ---
+        action_frame = ttk.Frame(self.root, padding=(12, 4, 12, 2))
         action_frame.pack(fill=tk.X)
 
         self.transcribe_btn = ttk.Button(
             action_frame,
-            text="Transcribe",
+            text="Transcribe File",
             command=self._start_transcription,
             style="Accent.TButton",
         )
@@ -543,6 +602,66 @@ class TranscriberApp:
             state=tk.DISABLED,
         )
         self.save_btn.pack(side=tk.LEFT, padx=6)
+
+        # --- Action buttons row 2: live mode ---
+        live_frame = ttk.Frame(self.root, padding=(12, 2, 12, 4))
+        live_frame.pack(fill=tk.X)
+
+        style.configure(
+            "Listen.TButton",
+            font=("Helvetica", 10, "bold"),
+            foreground="white",
+            background="#059669",
+            bordercolor="#047857",
+            lightcolor="#10b981",
+            darkcolor="#065f46",
+        )
+        style.map(
+            "Listen.TButton",
+            background=[("disabled", "#94a3b8")],
+            foreground=[("disabled", "#e2e8f0")],
+        )
+        style.configure(
+            "Stop.TButton",
+            font=("Helvetica", 10, "bold"),
+            foreground="white",
+            background="#dc2626",
+            bordercolor="#b91c1c",
+            lightcolor="#ef4444",
+            darkcolor="#991b1b",
+        )
+        style.map(
+            "Stop.TButton",
+            background=[("disabled", "#94a3b8")],
+            foreground=[("disabled", "#e2e8f0")],
+        )
+
+        self.listen_btn = ttk.Button(
+            live_frame,
+            text="🎤  Start Listening",
+            command=self._start_listening,
+            style="Listen.TButton",
+        )
+        self.listen_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.stop_btn = ttk.Button(
+            live_frame,
+            text="⏹  Stop",
+            command=self._stop_listening,
+            state=tk.DISABLED,
+            style="Stop.TButton",
+        )
+        self.stop_btn.pack(side=tk.LEFT, padx=6)
+
+        self.clear_btn = ttk.Button(
+            live_frame,
+            text="🗑  Clear Transcript",
+            command=self._clear_transcript,
+        )
+        self.clear_btn.pack(side=tk.LEFT, padx=6)
+
+        # Separator between controls and text area
+        ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=12)
 
         # --- Transcript text area ---
         text_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
@@ -588,11 +707,216 @@ class TranscriberApp:
         self.root.bind("<Command-t>", lambda _: self._start_transcription())
         self.root.bind("<Command-c>", lambda _: self._copy_text())
         self.root.bind("<Command-s>", lambda _: self._save_text())
+        self.root.bind("<Command-l>", lambda _: self._start_listening())
+        self.root.bind("<Command-.>", lambda _: self._stop_listening())
+        self.root.bind("<Command-Escape>", lambda _: self._stop_listening())
+
+    # ── Live microphone transcription ─────────────────────────────────
+
+    def _start_listening(self):
+        """Start live microphone transcription in a background thread."""
+        if self.is_listening or self.is_transcribing:
+            return
+
+        # Ensure model is loaded before starting mic
+        try:
+            _load_model(status_callback=lambda m: self.root.after(0, lambda: self.status_var.set(m)))
+        except Exception as e:
+            messagebox.showerror("Model Error", f"Failed to load model:\n{e}")
+            return
+
+        self.is_listening = True
+        self.live_stop.clear()
+        self.listen_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.clear_btn.config(state=tk.DISABLED)
+        self.select_btn.config(state=tk.DISABLED)
+        self.transcribe_btn.config(state=tk.DISABLED)
+
+        # Clear previous transcription and show placeholder
+        self.text_widget.config(state=tk.NORMAL)
+        self.text_widget.delete("1.0", tk.END)
+        self.text_widget.insert("1.0", "Listening… (speak now)\n")
+        self.text_widget.config(state=tk.DISABLED)
+        self.transcription_text = ""
+        self.copy_btn.config(state=tk.DISABLED)
+        self.save_btn.config(state=tk.DISABLED)
+
+        self.live_start_time = time.time()
+        self.status_var.set("Listening…")
+        self.lang_var.set("")
+        self._start_timer()
+
+        self.live_thread = threading.Thread(
+            target=self._live_listen_worker,
+            daemon=True,
+        )
+        self.live_thread.start()
+
+    def _stop_listening(self):
+        """Stop the live microphone transcription."""
+        if not self.is_listening:
+            return
+        self.is_listening = False
+        self.live_stop.set()
+        self._stop_timer()
+
+        self.status_var.set("Stopped listening.")
+        if self.transcription_text:
+            self.copy_btn.config(state=tk.NORMAL)
+            self.save_btn.config(state=tk.NORMAL)
+
+    def _clear_transcript(self):
+        """Clear the transcript text area."""
+        if self.is_listening or self.is_transcribing:
+            return
+        self.transcription_text = ""
+        self.text_widget.config(state=tk.NORMAL)
+        self.text_widget.delete("1.0", tk.END)
+        self.text_widget.config(state=tk.DISABLED)
+        self.copy_btn.config(state=tk.DISABLED)
+        self.save_btn.config(state=tk.DISABLED)
+        self.status_var.set("Transcript cleared.")
+        self.lang_var.set("")
+
+    def _live_listen_worker(self):
+        """
+        Background worker: capture microphone audio in 3-second chunks
+        and transcribe each chunk. Appends results to the transcript.
+        """
+        import sounddevice as sd
+
+        _log("Live listen worker started")
+
+        try:
+            # Quick device check to surface permission errors early
+            devices = sd.query_devices()
+            _log(f"Sounddevice devices: {len(devices)} found")
+            default_input = sd.default.device[0]
+            _log(f"Default input device: {default_input}")
+            if default_input is None or default_input < 0:
+                raise RuntimeError("No input microphone found.")
+
+            continuous_text = ""
+
+            while not self.live_stop.is_set():
+                # Record a chunk
+                try:
+                    recording = sd.rec(
+                        LIVE_CHUNK_SAMPLES,
+                        samplerate=LIVE_SAMPLE_RATE,
+                        channels=1,
+                        dtype="float32",
+                    )
+                    sd.wait()  # blocks for LIVE_CHUNK_SECONDS
+                except Exception as _re:
+                    _log(f"Sounddevice rec failed: {_re}")
+                    raise
+
+                if self.live_stop.is_set():
+                    break
+
+                audio = recording.flatten()
+
+                # Check for silence — skip if max amplitude is below threshold
+                if np.max(np.abs(audio)) < LIVE_SILENCE_THRESHOLD:
+                    continue
+
+                # Show "Processing…" status while transcribing
+                self.root.after(0, lambda: self.status_var.set("Processing…"))
+
+                # Transcribe the chunk
+                text, lang, lang_prob = _transcribe_chunk(audio)
+                if text:
+                    if continuous_text:
+                        continuous_text += " " + text
+                    else:
+                        continuous_text = text
+                    # Update UI on main thread
+                    self.root.after(0, self._on_live_text, continuous_text, lang, lang_prob)
+                else:
+                    # No speech detected in this chunk — restore listening status
+                    self.root.after(0, lambda: self.status_var.set("Listening…"))
+
+            _log(f"Live listen worker stopped. Final length: {len(continuous_text)} chars")
+
+        except Exception as _e:
+            _log(f"Live listen worker error: {_e}")
+            _log(f"Full traceback:\n{_traceback.format_exc()}")
+            err_msg = str(_e)
+            if "CoreAudio" in err_msg or "input" in err_msg.lower():
+                err_msg = (
+                    "Microphone access denied or no microphone found.\n\n"
+                    "Please grant microphone permission in\n"
+                    "System Settings → Privacy & Security → Microphone"
+                )
+            self.root.after(0, self._on_live_error, err_msg)
+        finally:
+            # Re-enable UI buttons
+            self.root.after(0, self._on_live_stopped)
+
+    def _on_live_text(self, text: str, lang: str = "", lang_prob: float = 0.0):
+        """Called from main thread to update transcript with live text."""
+        self.transcription_text = text
+        self.text_widget.config(state=tk.NORMAL)
+        self.text_widget.delete("1.0", tk.END)
+        self.text_widget.insert("1.0", text)
+        self.text_widget.see(tk.END)
+        self.text_widget.config(state=tk.DISABLED)
+        # Show detected language
+        if lang and lang != "unknown":
+            prob_pct = f"{lang_prob * 100:.0f}%" if lang_prob else "—"
+            self.lang_var.set(f"Detected: {lang} ({prob_pct})")
+        # Restore listening status after processing
+        self.status_var.set("Listening…" if self.is_listening else "Ready")
+
+    def _on_live_error(self, err_msg: str):
+        """Called from main thread on live transcription error."""
+        self.is_listening = False
+        self._stop_timer()
+        self.status_var.set(f"Error: {err_msg}")
+        messagebox.showerror("Microphone Error", err_msg)
+
+    def _on_live_stopped(self):
+        """Called from main thread after live worker finishes."""
+        self.is_listening = False
+        self.listen_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.clear_btn.config(state=tk.NORMAL)
+        self.select_btn.config(state=tk.NORMAL)
+        self.transcribe_btn.config(state=tk.NORMAL)
+        if self.transcription_text:
+            self.copy_btn.config(state=tk.NORMAL)
+            self.save_btn.config(state=tk.NORMAL)
+
+    # ── Timer ──────────────────────────────────────────────────────────
+
+    def _start_timer(self):
+        """Start the elapsed-time timer (ticks every second)."""
+        self._update_timer()
+
+    def _stop_timer(self):
+        """Stop the elapsed-time timer."""
+        if self._timer_job:
+            try:
+                self.root.after_cancel(self._timer_job)
+            except Exception:
+                pass
+            self._timer_job = None
+
+    def _update_timer(self):
+        """Update the elapsed-time display."""
+        if not self.is_listening:
+            return
+        elapsed = int(time.time() - self.live_start_time)
+        mins, secs = divmod(elapsed, 60)
+        self.timer_var.set(f"⏱  {mins:02d}:{secs:02d}")
+        self._timer_job = self.root.after(1000, self._update_timer)
 
     # ── File selection ─────────────────────────────────────────────────
 
     def _select_file(self):
-        if self.is_transcribing:
+        if self.is_transcribing or self.is_listening:
             return
 
         path = filedialog.askopenfilename(
@@ -766,11 +1090,12 @@ class TranscriberApp:
             self.save_btn.config(state=tk.DISABLED)
 
     def _on_close(self):
-        if self.is_transcribing:
-            if not messagebox.askyesno(
-                "Quit?", "Transcription is in progress. Quit anyway?"
-            ):
+        if self.is_transcribing or self.is_listening:
+            msg = "Transcription is in progress. Quit anyway?" if self.is_transcribing else "Listening is in progress. Quit anyway?"
+            if not messagebox.askyesno("Quit?", msg):
                 return
+        self.live_stop.set()
+        self._stop_timer()
         self.root.destroy()
 
 

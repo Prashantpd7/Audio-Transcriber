@@ -131,6 +131,10 @@ hidden_imports = [
     "av.opaque",
     "av.datasets",
     "av.about",
+    # sounddevice (live microphone capture)
+    "sounddevice",
+    "sounddevice._sounddevice",
+    "_sounddevice",
     # huggingface + tokenizers
     "huggingface_hub",
     "huggingface_hub.hub",

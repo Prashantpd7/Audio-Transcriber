@@ -152,9 +152,9 @@ MODEL_SIZE = "large-v3"
 
 # Live microphone constants
 LIVE_SAMPLE_RATE = 16000
-LIVE_CHUNK_SECONDS = 2
+LIVE_CHUNK_SECONDS = 1          # shorter chunks = faster response
 LIVE_CHUNK_SAMPLES = LIVE_SAMPLE_RATE * LIVE_CHUNK_SECONDS
-LIVE_SILENCE_THRESHOLD = 0.001     # lower threshold for quieter speech
+LIVE_SILENCE_THRESHOLD = 0.0005  # lower threshold for quieter speech
 
 SUPPORTED_EXTENSIONS = (
     ".mp3", ".mp4", ".wav", ".m4a", ".aac",
@@ -666,34 +666,40 @@ class TranscriberApp:
         self.record_btn.pack(side=tk.LEFT)
 
         # --- Status / progress ---
-        progress_frame = ttk.Frame(self.root, padding=(12, 2, 12, 2))
-        progress_frame.pack(fill=tk.X)
+        # Row 1: status text (above the bar)
+        status_frame = ttk.Frame(self.root, padding=(12, 2, 12, 0))
+        status_frame.pack(fill=tk.X)
 
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(
-            progress_frame, textvariable=self.status_var, font=("Helvetica", 9)
-        ).pack(side=tk.LEFT)
+            status_frame, textvariable=self.status_var, font=("Helvetica", 9)
+        ).pack(anchor=tk.W)
 
-        # Cancel button (hidden by default, shown during file transcription)
-        self.cancel_btn = ttk.Button(
-            progress_frame,
-            text="✕",
-            command=self._cancel_transcription,
-            width=3,
-            style="Cancel.TButton",
-            state=tk.DISABLED,
-        )
-        self.cancel_btn.pack(side=tk.RIGHT, padx=(4, 0))
-
-        self.pct_label = ttk.Label(
-            progress_frame, text="", font=("Helvetica", 9), foreground="#2563eb", width=4
-        )
-        self.pct_label.pack(side=tk.RIGHT)
+        # Row 2: progress bar + % label + cancel ✕
+        bar_frame = ttk.Frame(self.root, padding=(12, 1, 12, 2))
+        bar_frame.pack(fill=tk.X)
 
         self.progress = ttk.Progressbar(
-            progress_frame, mode="determinate"
+            bar_frame, mode="determinate"
         )
-        self.progress.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(0, 4))
+        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.pct_label = ttk.Label(
+            bar_frame, text="", font=("Helvetica", 9), foreground="#2563eb", width=4
+        )
+        self.pct_label.pack(side=tk.LEFT, padx=(6, 0))
+
+        # Cancel "✕" — plain label, no box/background/border, just red text
+        self.cancel_lbl = tk.Label(
+            bar_frame,
+            text="  ✕",
+            fg="#dc2626",
+            font=("Helvetica", 11, "bold"),
+            cursor="hand2",
+        )
+        self.cancel_lbl.pack(side=tk.LEFT, padx=(8, 0))
+        self.cancel_lbl.bind("<Button-1>", lambda _: self._cancel_transcription())
+        self.cancel_lbl.pack_forget()  # hidden until transcription starts
 
         # --- Info row: language + elapsed time ---
         info_frame = ttk.Frame(self.root, padding=(12, 0, 12, 2))
@@ -763,15 +769,18 @@ class TranscriberApp:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.text_widget.configure(yscrollcommand=scrollbar.set)
 
-        # Clear button at bottom-right — always visible (disabled when empty)
+        # Clear button below the text widget — always visible (disabled when empty)
+        clear_frame = ttk.Frame(text_frame, padding=(0, 4, 0, 0))
+        clear_frame.pack(fill=tk.X)
+
         self.clear_btn = ttk.Button(
-            text_inner,
-            text="Clear",
+            clear_frame,
+            text="Clear Transcript",
             command=self._clear_transcript,
-            width=8,
+            width=16,
             state=tk.DISABLED,
         )
-        self.clear_btn.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se")
+        self.clear_btn.pack(side=tk.RIGHT)
 
         # --- Button styles (all uniform) ---
         style.configure(
@@ -820,17 +829,7 @@ class TranscriberApp:
             "Clear.TButton",
             font=("Helvetica", 9),
         )
-        style.configure(
-            "Cancel.TButton",
-            font=("Helvetica", 10, "bold"),
-            foreground="white",
-            background="#dc2626",
-            bordercolor="#b91c1c",
-        )
-        style.map(
-            "Cancel.TButton",
-            background=[("active", "#b91c1c"), ("!active", "#dc2626")],
-        )
+
 
         # Keyboard shortcuts
         self.root.bind("<Command-o>", lambda _: self._select_file())
@@ -918,8 +917,12 @@ class TranscriberApp:
         Background worker: capture microphone audio using a continuous
         InputStream (keeps the mic open — no on/off flashing) and
         transcribe each chunk. Appends results to the transcript.
+
+        Uses a thread-safe queue to buffer audio between the callback
+        thread and the transcription loop.
         """
         import sounddevice as sd
+        import queue
 
         _log("Live listen worker started")
 
@@ -937,15 +940,16 @@ class TranscriberApp:
             if continuous_text:
                 continuous_text += "\n\n--- New Recording ---\n\n"
 
-            # Buffer to accumulate raw audio between chunk transcriptions
-            audio_buffer = []
+            # Thread-safe audio buffer
+            audio_queue = queue.Queue()
             samples_per_chunk = LIVE_CHUNK_SAMPLES
+            _log(f"Chunk size: {samples_per_chunk} samples ({LIVE_CHUNK_SECONDS}s)")
 
             # Callback for InputStream — called by sounddevice in a background thread
             def _audio_callback(indata, frames, time_info, status):
                 if status:
                     _log(f"InputStream status: {status}")
-                audio_buffer.append(indata.copy())
+                audio_queue.put(indata.copy())
 
             # Open a continuous InputStream — mic stays ON the whole time
             stream = sd.InputStream(
@@ -957,45 +961,51 @@ class TranscriberApp:
             stream.start()
             _log("InputStream started — mic is now continuously open")
 
+            # Internal buffer for building up chunks
+            chunk_buffer = np.array([], dtype=np.float32)
+            chunks_transcribed = 0
+            chunk_skipped_silence = 0
+
             try:
                 while not self.live_stop.is_set():
-                    # Sleep a bit to let audio accumulate
-                    time.sleep(0.1)
+                    # Pull all available audio from the queue
+                    try:
+                        while True:
+                            data = audio_queue.get_nowait()
+                            chunk_buffer = np.append(chunk_buffer, data.flatten())
+                    except queue.Empty:
+                        pass
 
-                    # Calculate how many samples we have buffered
-                    total_samples = sum(len(chunk) for chunk in audio_buffer)
-                    if total_samples < samples_per_chunk:
-                        continue  # not enough audio yet
+                    if len(chunk_buffer) < samples_per_chunk:
+                        time.sleep(0.05)  # short sleep before checking again
+                        continue
 
-                    # Concatenate buffered audio up to chunk size
-                    all_audio = np.concatenate(audio_buffer, axis=0).flatten()
-                    if len(all_audio) >= samples_per_chunk:
-                        chunk = all_audio[:samples_per_chunk]
-                        # Keep remainder for next chunk
-                        remaining = all_audio[samples_per_chunk:]
-                        audio_buffer.clear()
-                        if len(remaining) > 0:
-                            audio_buffer.append(remaining.reshape(-1, 1))
-                    else:
-                        continue  # not enough after all
+                    # Take exactly one chunk from the front
+                    chunk = chunk_buffer[:samples_per_chunk]
+                    chunk_buffer = chunk_buffer[samples_per_chunk:]
 
                     if self.live_stop.is_set():
                         break
 
                     # Check for silence
-                    rms = np.sqrt(np.mean(chunk ** 2))
                     peak = np.max(np.abs(chunk))
-                    _log(f"Chunk: RMS={rms:.6f}, peak={peak:.6f}, threshold={LIVE_SILENCE_THRESHOLD}")
+                    rms = np.sqrt(np.mean(chunk ** 2))
                     if peak < LIVE_SILENCE_THRESHOLD:
-                        _log("  -> below threshold, skipping")
+                        chunk_skipped_silence += 1
+                        if chunk_skipped_silence <= 5 or chunk_skipped_silence % 20 == 0:
+                            _log(f"Silence: RMS={rms:.6f}, peak={peak:.6f}, skipped={chunk_skipped_silence}")
                         continue
+
+                    _log(f"Chunk {chunks_transcribed}: RMS={rms:.6f}, peak={peak:.6f}")
 
                     # Show "Processing..." while transcribing
                     self.root.after(0, lambda: self.status_var.set("Processing..."))
 
-                    _log(f"  -> transcribing...")
+                    _log(f"  -> transcribing chunk {chunks_transcribed}...")
                     text, lang, lang_prob = _transcribe_chunk(chunk)
-                    _log(f"  -> result: text_len={len(text)}, lang={lang}")
+                    chunks_transcribed += 1
+                    _log(f"  -> result: text_len={len(text)}, lang={lang}, prob={lang_prob:.2f}")
+
                     if text:
                         if continuous_text:
                             continuous_text += " " + text
@@ -1008,7 +1018,7 @@ class TranscriberApp:
             finally:
                 stream.stop()
                 stream.close()
-                _log("InputStream closed — mic turned off")
+                _log(f"InputStream closed. Transcribed: {chunks_transcribed}, skipped: {chunk_skipped_silence}")
 
             _log(f"Live listen worker stopped. Final length: {len(continuous_text)} chars")
 
@@ -1141,7 +1151,7 @@ class TranscriberApp:
         self.progress["value"] = 0
         self.pct_label.config(text="")
         self._last_reported_pct = -1
-        self.cancel_btn.config(state=tk.NORMAL)
+        self.cancel_lbl.pack(side=tk.LEFT, padx=(8, 0))  # show cancel button
         self.worker_thread = threading.Thread(
             target=self._transcribe_worker,
             args=(self.file_path,),
@@ -1184,13 +1194,13 @@ class TranscriberApp:
             return
         self._cancel_requested = True
         self.status_var.set("Cancelling...")
-        self.cancel_btn.config(state=tk.DISABLED)
+        self.cancel_lbl.pack_forget()
         _log("Transcription cancel requested")
 
     def _on_transcription_done(self, result: dict):
         self.progress.stop()
         self.pct_label.config(text="")
-        self.cancel_btn.config(state=tk.DISABLED)
+        self.cancel_lbl.pack_forget()
         self.is_transcribing = False
         self._set_ui_busy(False)
 
@@ -1223,7 +1233,7 @@ class TranscriberApp:
     def _on_transcription_error(self, exc: Exception):
         self.progress.stop()
         self.pct_label.config(text="")
-        self.cancel_btn.config(state=tk.DISABLED)
+        self.cancel_lbl.pack_forget()
         self.is_transcribing = False
         self._cancel_requested = False
         self._set_ui_busy(False)

@@ -59,7 +59,8 @@
 | **Python** | 3.10 | 3.12+ |
 | **RAM** | 4 GB | 8 GB+ |
 | **Disk** | 5 GB free | 10 GB+ (includes model cache) |
-| **FFmpeg** | 4.0 | Latest |
+
+> **Note:** FFmpeg is **not required** — all audio decoding is handled by PyAV (bundled with the app).
 
 ### Platform Support
 
@@ -67,31 +68,14 @@
 |----------|--------|-------|
 | **macOS** (Intel) | ✅ Fully supported | Tested on macOS 14+ |
 | **macOS** (Apple Silicon M1–M4) | ✅ Fully supported | Best performance |
-| **Linux** | ✅ Supported | Requires `tkinter` |
-| **Windows** | ✅ Supported | Requires Python + FFmpeg |
+| **Linux** | ✅ Supported | Requires `tkinter` (`sudo apt install python3-tk`) |
+| **Windows** | ✅ Supported | Requires Python + Tkinter |
 
 ---
 
 ## Installation
 
-### 1. Install FFmpeg
-
-**macOS (Homebrew):**
-```bash
-brew install ffmpeg
-```
-
-**Linux (apt):**
-```bash
-sudo apt install ffmpeg
-```
-
-**Windows (chocolatey):**
-```bash
-choco install ffmpeg
-```
-
-### 2. Clone & Set Up
+### 1. Clone & Set Up
 
 ```bash
 git clone https://github.com/Prashantpd7/Audio-Transcriber.git
@@ -105,7 +89,7 @@ source venv/bin/activate   # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. Run the App
+### 2. Run the App
 
 ```bash
 python3 transcriber.py

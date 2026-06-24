@@ -13,6 +13,7 @@ import threading
 from pathlib import Path
 import time
 import traceback as _traceback
+import numpy as np
 
 # ---------------------------------------------------------------------------
 #  Startup log — always write to ~/Library/Logs/AudioTranscriber.log
@@ -150,11 +151,11 @@ APP_SIZE = "820x660"
 MODEL_SIZE = "large-v3"         # ~3 GB download on first run, cached locally
 
 SUPPORTED_EXTENSIONS = (
-    ".mp3", ".wav", ".m4a", ".aac",
+    ".mp3", ".mp4", ".wav", ".m4a", ".aac",
     ".flac", ".ogg", ".webm"
 )
 
-SUPPORTED_FORMATS_STR = "Audio files (*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.webm)"
+SUPPORTED_FORMATS_STR = "Audio / Video files (*.mp3 *.mp4 *.wav *.m4a *.aac *.flac *.ogg *.webm)"
 
 CONFIDENCE_THRESHOLD = 0.4  # segments below this avg_logprob get [unclear] marking
 
@@ -199,6 +200,88 @@ def _load_model(status_callback=None):
         status_callback("Model loaded.")
 
 
+# ---------------------------------------------------------------------------
+#  Audio loader — uses PyAV instead of FFmpeg subprocess
+#  PyAV is bundled in the standalone app, eliminating the FFmpeg dependency.
+# ---------------------------------------------------------------------------
+
+def load_audio(file_path: str) -> np.ndarray:
+    """
+    Decode any audio/video file to 16 kHz mono float32 using PyAV.
+
+    Returns a numpy array in [-1, 1] range, compatible with Faster-Whisper.
+    """
+    import av
+
+    _log(f"PyAV opening: {file_path}")
+    _log(f"PyAV version: {av.__version__}")
+
+    try:
+        container = av.open(file_path)
+    except Exception as _e:
+        _log(f"PyAV open() FAILED: {_e}")
+        _log(f"Traceback:\n{_traceback.format_exc()}")
+        raise ValueError(f"Cannot open audio file: {_e}") from _e
+
+    # Find the audio stream
+    audio_stream = None
+    for stream in container.streams:
+        if stream.type == "audio":
+            audio_stream = stream
+            _log(f"  Audio stream: index={stream.index}  codec={stream.codec_context.name}  "
+                 f"sample_rate={stream.sample_rate}  channels={stream.channels}")
+            break
+
+    if audio_stream is None:
+        container.close()
+        raise ValueError(f"No audio stream found in '{file_path}'")
+
+    # Use format='s16' (interleaved int16) with mono + 16 kHz
+    resampler = av.audio.resampler.AudioResampler(
+        format="s16",
+        layout="mono",
+        rate=16000,
+    )
+
+    audio_stream.thread_type = "AUTO"
+
+    all_frames = []
+    try:
+        for frame in container.decode(audio=0):
+            if frame is None:
+                continue
+            frame.pts = None  # prevent PTS discontinuity warnings
+            out = resampler.resample(frame)
+            # In newer PyAV, resample() may return a list of AudioFrames
+            frames_out = out if isinstance(out, (list, tuple)) else [out]
+            for f_out in frames_out:
+                if f_out is not None:
+                    arr = f_out.to_ndarray()
+                    if arr.size > 0:
+                        all_frames.append(arr)
+    except Exception as _de:
+        _log(f"PyAV decode error: {_de}")
+        _log(f"Traceback:\n{_traceback.format_exc()}")
+        # Some files may have decode errors mid-stream; collect what we can
+    finally:
+        container.close()
+
+    if not all_frames:
+        raise ValueError(f"No audio data could be decoded from '{file_path}'")
+
+    audio = np.concatenate(all_frames, axis=None)
+    # Remove DC offset
+    audio = audio - np.mean(audio)
+    # Convert int16 → float32 in [-1, 1]
+    audio = audio.astype(np.float32) / 32768.0
+
+    duration = len(audio) / 16000.0
+    _log(f"Audio loaded: {len(audio)} samples, {duration:.1f}s, "
+         f"range=[{audio.min():.4f}, {audio.max():.4f}]")
+
+    return audio
+
+
 def transcribe_audio(
     file_path: str,
     progress_callback=None,
@@ -207,6 +290,9 @@ def transcribe_audio(
     """
     Run transcription on *file_path* inside a worker thread.
 
+    Uses PyAV to decode audio (supports MP3, MP4, WAV, M4A, AAC, FLAC,
+    OGG, WEBM — and any format PyAV can handle).
+
     Returns a dict with keys:
         text          – formatted transcription
         raw_segments  – list of segment dicts (for debugging / confidence)
@@ -214,17 +300,35 @@ def transcribe_audio(
         language_prob – detection confidence
         duration      – audio duration in seconds
     """
-    # Ensure model is loaded
+    # --- Step 1: Load audio with PyAV ---
+    _log(f"Loading audio from: {file_path}")
+    ext = Path(file_path).suffix.lower()
+    _log(f"File extension: {ext}")
+    _log(f"File size: {_file_size(file_path)}")
+
+    if status_callback:
+        status_callback("Decoding audio…")
+
+    try:
+        audio = load_audio(file_path)
+        _log(f"Audio loaded successfully: {len(audio)} samples")
+    except Exception as _ae:
+        _log(f"Audio loading FAILED: {_ae}")
+        _log(f"Full traceback:\n{_traceback.format_exc()}")
+        raise
+
+    # --- Step 2: Ensure model is loaded ---
     _load_model(status_callback)
 
     if status_callback:
         status_callback("Transcribing…")
 
+    # --- Step 3: Transcribe ---
     with _model_lock:
-        _log("model.transcribe() called…")
+        _log("model.transcribe() called (numpy array input)…")
         try:
             segments, info = _model.transcribe(
-                file_path,
+                audio,                  # pass numpy array directly
                 beam_size=5,
                 best_of=5,
                 temperature=0.0,          # deterministic, highest accuracy
@@ -247,8 +351,6 @@ def transcribe_audio(
 
     # Collect results
     collected_segments = []
-    raw_text_parts = []
-    prev_end = 0.0
 
     for seg in segments:
         seg_dict = {
@@ -260,11 +362,11 @@ def transcribe_audio(
             "confidence": seg.avg_logprob,  # alias for clarity
         }
         collected_segments.append(seg_dict)
-        raw_text_parts.append(seg.text.strip())
 
         # Update progress roughly based on time consumed
         if progress_callback:
-            pct = min(95, int((seg.end / max(info.duration, 1)) * 100))
+            dur = getattr(info, "duration", 1.0) or 1.0
+            pct = min(95, int((seg.end / max(dur, 1)) * 100))
             progress_callback(pct)
 
     if status_callback:
@@ -273,12 +375,19 @@ def transcribe_audio(
     # Build the final text with paragraph formatting
     formatted = _format_transcript(collected_segments)
 
+    duration = getattr(info, "duration", 0.0) or (len(audio) / 16000.0)
+    language = getattr(info, "language", "unknown") or "unknown"
+    language_prob = getattr(info, "language_probability", 0.0) or 0.0
+
+    _log(f"Transcription complete: lang={language}, prob={language_prob:.2%}, "
+         f"duration={duration:.1f}s, segments={len(collected_segments)}")
+
     return {
         "text": formatted,
         "raw_segments": collected_segments,
-        "language": info.language if info else "unknown",
-        "language_prob": info.language_probability if info else 0.0,
-        "duration": info.duration if info else 0.0,
+        "language": language,
+        "language_prob": language_prob,
+        "duration": duration,
     }
 
 

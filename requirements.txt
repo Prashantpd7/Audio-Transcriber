@@ -6,6 +6,9 @@
 # Core transcription engine
 faster-whisper>=1.0.0
 
-# Note: FFmpeg is required for audio processing but is a system-level
-# dependency installed via your package manager (brew, apt, choco, etc.).
-# See README.md for installation instructions.
+# Audio decoding (handles MP3, MP4, WAV, M4A, AAC, FLAC, OGG, WEBM)
+# Replaces the need for a system-level FFmpeg installation.
+av>=12.0.0
+
+# Numerical computing (required by faster-whisper & audio loading)
+numpy>=1.24.0

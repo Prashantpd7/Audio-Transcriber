@@ -60,10 +60,25 @@ if _tk_lib.exists():
 
 # ---------- data files (needed at runtime, NOT collected automatically) ----------
 extra_datas = []
+
 # faster-whisper VAD model  (silero_vad_v6.onnx) — required for vad_filter=True
 _vad_asset = SITE_PACKAGES / "faster_whisper" / "assets" / "silero_vad_v6.onnx"
 if _vad_asset.exists():
     extra_datas.append((str(_vad_asset), "faster_whisper/assets"))
+
+# yaml package Python source files — the C extension _yaml.so is collected
+# automatically by PyInstaller, but the .py files (__init__.py, dumper.py,
+# loader.py, etc.) are sometimes MISSING in the bundle, causing the
+# "module 'yaml' has no attribute 'dump'" crash at runtime.
+_yaml_pkg = SITE_PACKAGES / "yaml"
+if _yaml_pkg.is_dir():
+    for _f in _yaml_pkg.iterdir():
+        if _f.is_file() and _f.suffix == ".py":
+            extra_datas.append((str(_f), "yaml"))
+    # Also add the _yaml C extension explicitly if not already bundled
+    _yaml_so = _yaml_pkg / "_yaml.cpython-313-darwin.so"
+    if _yaml_so.exists():
+        extra_binaries.append((str(_yaml_so), "yaml"))
 
 # ---------------------------------------------------------------------------
 # Hidden imports
@@ -97,6 +112,7 @@ hidden_imports = [
     "av.codec.context",
     "av.video",
     "av.audio",
+    "av.audio.resampler",
     "av.subtitles",
     "av.filter",
     "av.sidedata",
@@ -120,6 +136,8 @@ hidden_imports = [
     "huggingface_hub.hub",
     "huggingface_hub.file_download",
     "huggingface_hub.snapshot_download",
+    "huggingface_hub.repocard",
+    "huggingface_hub.utils._fixes",
     "hf_xet",
     "tokenizers",
     "tokenizers.models",
@@ -128,6 +146,10 @@ hidden_imports = [
     "tokenizers.decoders",
     "tokenizers.normalizers",
     "tokenizers.processors",
+    # yaml (fixes "module 'yaml' has no attribute 'dump'" crash)
+    "yaml",
+    "yaml._yaml",
+    "_yaml",
     # general
     "numpy",
     "tqdm",
@@ -146,6 +168,55 @@ excluded_imports = [
     "soundfile", "librosa",
     "plotly", "plotly.figure_factory", "plotly.graph_objects",
     "IPython", "ipykernel", "jupyter", "notebook",
+    # Anaconda extras that bloat the bundle
+    "panel", "bokeh", "dask", "distributed", "astropy", "altair",
+    "alabaster", "anaconda_catalogs", "arrow", "asynctest",
+    "bottleneck", "conda", "conda_index", "conda_build", "conda_env",
+    "conda_package_handling", "conda_repo_cli", "conda_repos",
+    "conda_content_trust", "conda_package_streaming",
+    "conda_smithy", "cookiecutter", "cytoolz",
+    "dask_image", "datashader", "datashape", "diagrams",
+    "docutils", "feedparser", "flask",
+    "geopandas", "geopy", "guzzle_sphinx_theme",
+    "holoviews", "hvplot", "intake", "ipython_genutils",
+    "jedi", "joblib", "jupyter_client", "jupyter_core",
+    "jupyter_events", "jupyter_server", "jupyterlab",
+    "jupyterlab_pygments", "jupyterlab_server",
+    "llvmlite", "locket",
+    "matplotlib_inline", "mistune", "mpmath", "multipledispatch",
+    "numba", "numexpr", "openpyxl",
+    "partd", "patsy", "pdfminer", "pdfplumber",
+    "pep8", "pexpect", "pickleshare", "pillow", "pip",
+    "prometheus_client", "prompt_toolkit", "ptyprocess",
+    "pulp", "pvlib", "pyarrow", "pybind11", "pycodestyle",
+    "pycosat", "pycparser", "pyct", "pycurl",
+    "pydantic_settings", "pydeck", "pyerfa", "pyflakes",
+    "pygithub", "pygments", "pygraphviz", "pylint",
+    "pympler", "pynvim", "pyodbc", "pyparsing",
+    "pyrsistent", "pyshp", "pysocks", "pytables",
+    "pytest", "pytest_remotedata", "python_dateutil",
+    "python_jsonrpc_server", "python_lsp_jsonrpc",
+    "python_lsp_server", "pytz", "pyviz_comms", "pywavelets",
+    "pyzotero",
+    "reportlab", "rope",
+    "ruamel", "ruamel.yaml", "ruamel.yaml.clib",
+    "ruamel_yaml_conda", "scikit_image", "scikit_learn",
+    "seaborn", "send2trash", "shapely",
+    "sherpa", "sip", "snowballstemmer",
+    "sortedcontainers", "sphinx", "sphinxcontrib",
+    "sphinx_copybutton", "sphinx_issues", "sphinx_panels",
+    "sphinx_tabs", "spyder", "spyder_kernels",
+    "sqlalchemy", "statsmodels", "sympy", "tabulate",
+    "tbb", "tblib", "terminado", "testpath",
+    "textdistance", "texttable", "threadpoolctl",
+    "tinycss2", "tlz", "tomli_w",
+    "toolz", "tornado", "traitlets",
+    "trio", "twine", "tzdata",
+    "ujson", "unicodecsv", "unidecode",
+    "virtualenv", "wcwidth", "webencodings",
+    "werkzeug", "wheel", "wrapt", "xlrd", "xlsxwriter",
+    "xlwings", "xyzservices", "zarr", "zict",
+    "zipp", "zstandard",
 ]
 
 # ---------------------------------------------------------------------------
@@ -174,6 +245,7 @@ a = Analysis(
         "tokenizers": "py",
         "numpy": "py",
         "tkinter": "py",
+        "yaml": "py",
     },
 )
 

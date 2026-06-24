@@ -150,11 +150,8 @@ APP_TITLE = "Audio Transcriber"
 APP_SIZE = "860x700"
 MODEL_SIZE = "large-v3"
 
-# Live microphone constants
+# Recording constants
 LIVE_SAMPLE_RATE = 16000
-LIVE_CHUNK_SECONDS = 1          # shorter chunks = faster response
-LIVE_CHUNK_SAMPLES = LIVE_SAMPLE_RATE * LIVE_CHUNK_SECONDS
-LIVE_SILENCE_THRESHOLD = 0.0005  # lower threshold for quieter speech
 
 SUPPORTED_EXTENSIONS = (
     ".mp3", ".mp4", ".wav", ".m4a", ".aac",
@@ -546,46 +543,6 @@ def _to_hinglish(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-#  Live microphone transcription (chunk-based, runs in background thread)
-# ---------------------------------------------------------------------------
-
-def _transcribe_chunk(audio_chunk: np.ndarray):
-    """
-    Transcribe a short audio chunk using the shared model.
-
-    Returns (text, language, language_probability) tuple.
-    text may be empty for silence. language is 'unknown' on failure.
-    Designed to be called from the live-listening worker thread.
-
-    Uses greedy decoding (beam_size=1) for maximum speed.
-    VAD is NOT applied here — silence detection happens before calling this.
-    """
-    with _model_lock:
-        try:
-            segments, info = _model.transcribe(
-                audio_chunk,
-                beam_size=1,
-                best_of=1,
-                temperature=0.0,
-                vad_filter=False,          # silence already pre-filtered
-                condition_on_previous_text=False,
-                no_speech_threshold=0.6,
-                log_prob_threshold=-1.0,
-                compression_ratio_threshold=2.4,
-            )
-            texts = [seg.text.strip() for seg in segments if seg.text.strip()]
-            language = getattr(info, "language", "unknown") or "unknown"
-            language_prob = getattr(info, "language_probability", 0.0) or 0.0
-            raw_text = " ".join(texts)
-            hinglish_text = _to_hinglish(raw_text)
-            return hinglish_text, language, language_prob
-        except Exception as _e:
-            _log(f"Live transcribe chunk error: {_e}")
-            _log(f"Traceback:\n{_traceback.format_exc()}")
-            return "", "unknown", 0.0
-
-
-# ---------------------------------------------------------------------------
 #  GUI
 # ---------------------------------------------------------------------------
 class TranscriberApp:
@@ -702,14 +659,13 @@ class TranscriberApp:
             padx=0,
             pady=0,
         )
-        # Match parent frame background so there's no visible rectangle
-        _bar_bg = bar_frame.cget("background")
-        self.cancel_lbl.config(bg=_bar_bg)
+        # No bg set — inherits from parent frame automatically (no visible box)
         self.cancel_lbl.pack(side=tk.LEFT, padx=(4, 0))
         self.cancel_lbl.bind("<Button-1>", lambda e: self._cancel_transcription())
-        # Hover effect: light red background on enter, restore on leave
+        # Hover effect: light red background on enter, restore to default on leave
+        self._cancel_bg_default = self.cancel_lbl.cget("background")
         self.cancel_lbl.bind("<Enter>", lambda e: self.cancel_lbl.config(bg="#fde8e8"))
-        self.cancel_lbl.bind("<Leave>", lambda e: self.cancel_lbl.config(bg=_bar_bg))
+        self.cancel_lbl.bind("<Leave>", lambda e: self.cancel_lbl.config(bg=self._cancel_bg_default))
         self.cancel_lbl.pack_forget()  # hidden until transcription starts
 
         # --- Info row: language + elapsed time ---
@@ -850,7 +806,7 @@ class TranscriberApp:
         self.root.bind("<Command-r>", lambda _: self._toggle_record())
         self.root.bind("<Command-Escape>", lambda _: self._toggle_record() if self.is_listening else None)
 
-    # ── Live microphone transcription ─────────────────────────────────
+    # ── Recording (record → save WAV → transcribe via same pipeline) ──
 
     def _toggle_record(self):
         """Toggle between Record and Stop states."""
@@ -860,54 +816,173 @@ class TranscriberApp:
             self._start_recording()
 
     def _start_recording(self):
-        """Start recording and transcribing from the microphone."""
+        """Start recording from microphone. Only records — no transcription yet."""
         if self.is_listening or self.is_transcribing:
-            return
-
-        # Ensure model is loaded before starting mic
-        try:
-            _load_model(status_callback=lambda m: self.root.after(0, lambda: self.status_var.set(m)))
-        except Exception as e:
-            messagebox.showerror("Model Error", f"Failed to load model:\n{e}")
             return
 
         self.is_listening = True
         self.live_stop.clear()
         self.record_btn.config(text="Stop", style="StopRecord.TButton")
-        self.clear_btn.config(state=tk.DISABLED)  # disable Clear during recording
+        self.clear_btn.config(state=tk.DISABLED)
         self.select_btn.config(state=tk.DISABLED)
         self.transcribe_btn.config(state=tk.DISABLED)
 
-        # Keep existing transcript — append separator to UI placeholder
-        self.text_widget.config(state=tk.NORMAL)
-        self.text_widget.see(tk.END)
-        self.text_widget.insert(tk.END, "\nListening... (speak now)\n")
-        self.text_widget.see(tk.END)
-        self.text_widget.config(state=tk.DISABLED)
-
         self.live_start_time = time.time()
-        self.status_var.set("Listening...")
+        self.status_var.set("Recording...")
         self.lang_var.set("")
-        _log("Live recording started — waiting for audio chunks")
+        self.timer_var.set("")
+        _log("Recording started")
         self._start_timer()
 
         self.live_thread = threading.Thread(
-            target=self._live_listen_worker,
+            target=self._record_worker,
             daemon=True,
         )
         self.live_thread.start()
 
     def _stop_recording(self):
-        """Stop recording. Show 'Transcribing...' until last chunk finishes."""
+        """Stop recording, save to temp WAV, then transcribe via same pipeline."""
         if not self.is_listening:
             return
         self.is_listening = False
         self.live_stop.set()
         self._stop_timer()
         self.record_btn.config(text="Record", style="Record.TButton")
-        # Show "Transcribing..." while worker finishes its last chunk
-        self.status_var.set("Transcribing remaining audio...")
-        _log("Stop requested — waiting for worker to finish last chunk")
+        self.status_var.set("Processing recording...")
+        _log("Recording stopped — saving and transcribing")
+
+    def _record_worker(self):
+        """
+        Background worker: record all audio to a buffer, then save as WAV
+        and transcribe using the same transcribe_audio() pipeline as file uploads.
+        """
+        import sounddevice as sd
+        import queue
+
+        _log("Record worker started")
+
+        try:
+            # Check for microphone
+            devices = sd.query_devices()
+            default_input = sd.default.device[0]
+            _log(f"Default input device: {default_input}")
+            if default_input is None or default_input < 0:
+                raise RuntimeError("No input microphone found.")
+
+            # Buffer all incoming audio
+            audio_queue = queue.Queue()
+
+            def _callback(indata, frames, time_info, status):
+                if status:
+                    _log(f"InputStream status: {status}")
+                audio_queue.put(indata.copy())
+
+            stream = sd.InputStream(
+                samplerate=LIVE_SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                callback=_callback,
+            )
+            stream.start()
+            _log("InputStream started — recording...")
+
+            # Collect all audio until stopped
+            all_chunks = []
+            try:
+                while not self.live_stop.is_set():
+                    try:
+                        data = audio_queue.get(timeout=0.1)
+                        all_chunks.append(data)
+                    except queue.Empty:
+                        pass
+            finally:
+                stream.stop()
+                stream.close()
+                _log(f"InputStream closed — recorded {len(all_chunks)} chunks")
+
+            if not all_chunks:
+                _log("No audio recorded")
+                self.root.after(0, self._on_recording_error, "No audio recorded.")
+                return
+
+            # Concatenate all audio into one array
+            recording = np.concatenate(all_chunks, axis=0).flatten()
+            duration = len(recording) / LIVE_SAMPLE_RATE
+            _log(f"Recording complete: {len(recording)} samples, {duration:.1f}s")
+
+            if duration < 0.5:
+                _log("Recording too short, skipping")
+                self.root.after(0, self._on_recording_error, "Recording too short (under 0.5s).")
+                return
+
+            # Save to temp WAV file
+            import struct
+            temp_dir = Path.home() / "Library" / "Caches" / "AudioTranscriber"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            temp_path = temp_dir / f"recording_{timestamp}.wav"
+
+            # Write WAV file (16-bit PCM, mono, 16kHz)
+            recording_int16 = (recording * 32767).astype(np.int16)
+            with open(temp_path, "wb") as f:
+                # WAV header
+                data_size = len(recording_int16) * 2  # 16-bit = 2 bytes per sample
+                f.write(b"RIFF")
+                f.write(struct.pack("<I", 36 + data_size))
+                f.write(b"WAVE")
+                f.write(b"fmt ")
+                f.write(struct.pack("<I", 16))  # chunk size
+                f.write(struct.pack("<H", 1))   # PCM format
+                f.write(struct.pack("<H", 1))   # mono
+                f.write(struct.pack("<I", LIVE_SAMPLE_RATE))  # sample rate
+                f.write(struct.pack("<I", LIVE_SAMPLE_RATE * 2))  # byte rate
+                f.write(struct.pack("<H", 2))   # block align
+                f.write(struct.pack("<H", 16))  # bits per sample
+                f.write(b"data")
+                f.write(struct.pack("<I", data_size))
+                f.write(recording_int16.tobytes())
+
+            _log(f"WAV saved: {temp_path} ({temp_path.stat().st_size} bytes)")
+
+            # Now transcribe using the SAME pipeline as file uploads
+            self.root.after(0, self._on_recording_saved, str(temp_path))
+
+        except Exception as _e:
+            _log(f"Record worker error: {_e}")
+            _log(f"Traceback:\n{_traceback.format_exc()}")
+            err_msg = str(_e)
+            if "CoreAudio" in err_msg or "input" in err_msg.lower():
+                err_msg = (
+                    "Microphone access denied or no microphone found.\n\n"
+                    "Please grant microphone permission in\n"
+                    "System Settings → Privacy & Security → Microphone"
+                )
+            self.root.after(0, self._on_recording_error, err_msg)
+
+    def _on_recording_saved(self, wav_path: str):
+        """Called after recording is saved. Starts transcription via same pipeline.
+        Button states are managed by _start_transcription_with_path."""
+        self.status_var.set("Transcribing recording...")
+        self.lang_var.set("")
+        self.timer_var.set("")
+
+        # Set file_path so the save dialog uses the right name
+        self.file_path = wav_path
+        self.file_label.config(text=f"Recording: {Path(wav_path).name}", foreground="#059669")
+
+        # Start transcription using the same pipeline as file uploads
+        self._start_transcription_with_path(wav_path)
+
+    def _on_recording_error(self, err_msg: str):
+        """Called on recording error."""
+        self.is_listening = False
+        self._stop_timer()
+        self.record_btn.config(text="Record", style="Record.TButton")
+        self.select_btn.config(state=tk.NORMAL)
+        self.transcribe_btn.config(state=tk.NORMAL)
+        self.timer_var.set("")
+        self.status_var.set(f"Error: {err_msg}")
+        messagebox.showerror("Microphone Error", err_msg)
 
     def _clear_transcript(self):
         """Clear the transcript text area."""
@@ -922,170 +997,6 @@ class TranscriberApp:
         self.status_var.set("Transcript cleared.")
         self.lang_var.set("")
         self.clear_btn.config(state=tk.DISABLED)
-
-    def _live_listen_worker(self):
-        """
-        Background worker: capture microphone audio using a continuous
-        InputStream (keeps the mic open — no on/off flashing) and
-        transcribe each chunk. Appends results to the transcript.
-
-        Uses a thread-safe queue to buffer audio between the callback
-        thread and the transcription loop.
-        """
-        import sounddevice as sd
-        import queue
-
-        _log("Live listen worker started")
-
-        try:
-            # Quick device check to surface permission errors early
-            devices = sd.query_devices()
-            _log(f"Sounddevice devices: {len(devices)} found")
-            default_input = sd.default.device[0]
-            _log(f"Default input device: {default_input}")
-            if default_input is None or default_input < 0:
-                raise RuntimeError("No input microphone found.")
-
-            # Start from existing transcript so re-recording preserves old text
-            continuous_text = self.transcription_text or ""
-            if continuous_text:
-                continuous_text += "\n\n--- New Recording ---\n\n"
-
-            # Thread-safe audio buffer
-            audio_queue = queue.Queue()
-            samples_per_chunk = LIVE_CHUNK_SAMPLES
-            _log(f"Chunk size: {samples_per_chunk} samples ({LIVE_CHUNK_SECONDS}s)")
-
-            # Callback for InputStream — called by sounddevice in a background thread
-            def _audio_callback(indata, frames, time_info, status):
-                if status:
-                    _log(f"InputStream status: {status}")
-                audio_queue.put(indata.copy())
-
-            # Open a continuous InputStream — mic stays ON the whole time
-            stream = sd.InputStream(
-                samplerate=LIVE_SAMPLE_RATE,
-                channels=1,
-                dtype="float32",
-                callback=_audio_callback,
-            )
-            stream.start()
-            _log("InputStream started — mic is now continuously open")
-
-            # Internal buffer for building up chunks
-            chunk_buffer = np.array([], dtype=np.float32)
-            chunks_transcribed = 0
-            chunk_skipped_silence = 0
-
-            try:
-                while not self.live_stop.is_set():
-                    # Pull all available audio from the queue
-                    try:
-                        while True:
-                            data = audio_queue.get_nowait()
-                            chunk_buffer = np.append(chunk_buffer, data.flatten())
-                    except queue.Empty:
-                        pass
-
-                    if len(chunk_buffer) < samples_per_chunk:
-                        time.sleep(0.05)  # short sleep before checking again
-                        continue
-
-                    # Take exactly one chunk from the front
-                    chunk = chunk_buffer[:samples_per_chunk]
-                    chunk_buffer = chunk_buffer[samples_per_chunk:]
-
-                    if self.live_stop.is_set():
-                        break
-
-                    # Check for silence
-                    peak = np.max(np.abs(chunk))
-                    rms = np.sqrt(np.mean(chunk ** 2))
-                    if peak < LIVE_SILENCE_THRESHOLD:
-                        chunk_skipped_silence += 1
-                        if chunk_skipped_silence <= 5 or chunk_skipped_silence % 20 == 0:
-                            _log(f"Silence: RMS={rms:.6f}, peak={peak:.6f}, skipped={chunk_skipped_silence}")
-                        continue
-
-                    _log(f"Chunk {chunks_transcribed}: RMS={rms:.6f}, peak={peak:.6f}")
-
-                    # Show "Processing..." while transcribing
-                    self.root.after(0, lambda: self.status_var.set("Processing..."))
-
-                    _log(f"  -> transcribing chunk {chunks_transcribed}...")
-                    text, lang, lang_prob = _transcribe_chunk(chunk)
-                    chunks_transcribed += 1
-                    _log(f"  -> result: text_len={len(text)}, lang={lang}, prob={lang_prob:.2f}")
-
-                    if text:
-                        if continuous_text:
-                            continuous_text += " " + text
-                        else:
-                            continuous_text = text
-                        self.root.after(0, self._on_live_text, continuous_text, lang, lang_prob)
-                    else:
-                        self.root.after(0, lambda: self.status_var.set("Listening..."))
-
-            finally:
-                stream.stop()
-                stream.close()
-                _log(f"InputStream closed. Transcribed: {chunks_transcribed}, skipped: {chunk_skipped_silence}")
-
-            _log(f"Live listen worker stopped. Final length: {len(continuous_text)} chars")
-
-        except Exception as _e:
-            _log(f"Live listen worker error: {_e}")
-            _log(f"Full traceback:\n{_traceback.format_exc()}")
-            err_msg = str(_e)
-            if "CoreAudio" in err_msg or "input" in err_msg.lower():
-                err_msg = (
-                    "Microphone access denied or no microphone found.\n\n"
-                    "Please grant microphone permission in\n"
-                    "System Settings → Privacy & Security → Microphone"
-                )
-            self.root.after(0, self._on_live_error, err_msg)
-        finally:
-            # Re-enable UI buttons
-            self.root.after(0, self._on_live_stopped)
-
-    def _on_live_text(self, text: str, lang: str = "", lang_prob: float = 0.0):
-        """Called from main thread to update transcript with live text."""
-        self.transcription_text = text
-        self.text_widget.config(state=tk.NORMAL)
-        self.text_widget.delete("1.0", tk.END)
-        self.text_widget.insert("1.0", text)
-        self.text_widget.see(tk.END)
-        self.text_widget.config(state=tk.DISABLED)
-        # Show detected language
-        if lang and lang != "unknown":
-            prob_pct = f"{lang_prob * 100:.0f}%" if lang_prob else "—"
-            self.lang_var.set(f"Detected: {lang} ({prob_pct})")
-        # Show Clear button once we have text
-        self.clear_btn.config(state=tk.NORMAL)
-        # Restore listening status after processing
-        self.status_var.set("Listening..." if self.is_listening else "Ready")
-
-    def _on_live_error(self, err_msg: str):
-        """Called from main thread on live transcription error."""
-        self.is_listening = False
-        self._stop_timer()
-        self.status_var.set(f"Error: {err_msg}")
-        messagebox.showerror("Microphone Error", err_msg)
-
-    def _on_live_stopped(self):
-        """Called from main thread after live worker finishes."""
-        self.is_listening = False
-        self.record_btn.config(text="Record", style="Record.TButton")
-        self.select_btn.config(state=tk.NORMAL)
-        self.transcribe_btn.config(state=tk.NORMAL)
-        if self.status_var.get().startswith("Error"):
-            pass  # keep error message visible
-        else:
-            self.status_var.set("Stopped.")
-        self.clear_btn.config(state=tk.NORMAL if self.transcription_text else tk.DISABLED)
-        if self.transcription_text:
-            self.copy_btn.config(state=tk.NORMAL)
-            self.save_btn.config(state=tk.NORMAL)
 
     # ── Timer ──────────────────────────────────────────────────────────
 
@@ -1144,15 +1055,22 @@ class TranscriberApp:
     # ── Transcription (worker thread) ──────────────────────────────────
 
     def _start_transcription(self):
+        """Start transcription of the user-selected file."""
         if self.is_transcribing:
             return
         if not self.file_path:
             messagebox.showinfo("No file", "Please select an audio file first.")
             return
+        self._start_transcription_with_path(self.file_path)
+
+    def _start_transcription_with_path(self, file_path: str):
+        """Start transcription for a given path (file or recording)."""
+        if self.is_transcribing:
+            return
 
         self.is_transcribing = True
         self._cancel_requested = False
-        self._worker_gen = self._cancel_gen  # capture generation for stale-worker guard
+        self._worker_gen = self._cancel_gen
         self._set_ui_busy(True)
 
         self.text_widget.config(state=tk.NORMAL)
@@ -1162,10 +1080,10 @@ class TranscriberApp:
 
         self.progress["value"] = 0
         self._last_reported_pct = -1
-        self.cancel_lbl.pack(side=tk.LEFT, padx=(2, 0), pady=2)  # show cancel button
+        self.cancel_lbl.pack(side=tk.LEFT, padx=(2, 0), pady=2)
         self.worker_thread = threading.Thread(
             target=self._transcribe_worker,
-            args=(self.file_path,),
+            args=(file_path,),
             daemon=True,
         )
         self.worker_thread.start()
